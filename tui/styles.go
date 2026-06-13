@@ -73,4 +73,12 @@ var (
 
 	HelpStyle = lipgloss.NewStyle().
 			Foreground(subtle)
+
+	WarnStyle = lipgloss.NewStyle().
+			Foreground(warnCol).
+			Bold(true)
+
+	HighlightStyle = lipgloss.NewStyle().
+			Foreground(highlight).
+			Bold(true)
 )

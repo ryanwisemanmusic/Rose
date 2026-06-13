@@ -28,12 +28,11 @@ func (m model) renderMessages() string {
 		b.WriteString("\n\n")
 	}
 
-	if m.streaming && m.partial != "" {
+	if m.execPhase != phaseIdle && len(m.messages) > 0 && m.messages[len(m.messages)-1].role == "assistant" && m.messages[len(m.messages)-1].content == "" {
 		b.WriteString(AssistantTagStyle.Render("● Rose"))
 		b.WriteString("\n")
-		b.WriteString(MessageStyle.Render(renderContent(m.partial)))
-		b.WriteString("\n\n")
 		b.WriteString(m.spinner.View())
+		b.WriteString("\n")
 	}
 
 	return b.String()
@@ -109,22 +108,44 @@ func (m model) renderModelList() string {
 func (m model) renderHelp() string {
 	var b strings.Builder
 
-	b.WriteString(HeaderStyle.Render("Rose Help"))
+	b.WriteString(HeaderStyle.Render(fmt.Sprintf("Rose Help  ·  %s", m.workspace.ProjectName)))
 	b.WriteString("\n\n")
 
-	helpItems := []struct {
+	if m.workspace.RoseRoot != "" && !m.workspace.IsInRoseProject() {
+		b.WriteString(SystemTagStyle.Render(fmt.Sprintf("✦ Running from %s  ·  Source at %s",
+			m.workspace.ProjectName, m.workspace.RoseRoot)))
+		b.WriteString("\n\n")
+	}
+
+	b.WriteString(HeaderSubStyle.Render("Commands"))
+	b.WriteString("\n")
+
+	type helpEntry struct {
 		key  string
 		desc string
-	}{
+	}
+	helpItems := []helpEntry{
 		{"enter", "Send message"},
+		{"@path", "Reference files/folders in prompt"},
 		{"ctrl+e", "Toggle code/chat mode"},
 		{"ctrl+t", "Select model"},
+		{"ctrl+s", "Self-improve (reflect on own code)"},
+		{"ctrl+u", "Update Rose from git + rebuild"},
 		{"ctrl+l", "Clear conversation"},
 		{"ctrl+h", "Show this help"},
-		{"tab", "Execute code in input"},
+		{"tab", "Execute raw code in input"},
 		{"esc", "Cancel/interrupt"},
 		{"ctrl+c", "Quit"},
 	}
+
+	b.WriteString("\n")
+	b.WriteString(HeaderSubStyle.Render("Auto-Fix System"))
+	b.WriteString("\n")
+	b.WriteString("  When code execution fails, Rose automatically:\n")
+	b.WriteString("  1. Reads the error output\n")
+	b.WriteString("  2. Fixes the code\n")
+	b.WriteString("  3. Re-executes (up to 5 attempts)\n")
+	b.WriteString("  4. Stores the fix pattern for future learning\n")
 
 	for _, h := range helpItems {
 		b.WriteString(fmt.Sprintf("  %-12s %s\n",
@@ -134,7 +155,52 @@ func (m model) renderHelp() string {
 	}
 
 	b.WriteString("\n")
+	b.WriteString(HeaderSubStyle.Render("Workspace"))
+	b.WriteString("\n")
+	b.WriteString(fmt.Sprintf("  Dir:     %s\n", m.workspace.CurrentDir))
+	b.WriteString(fmt.Sprintf("  Project: %s\n", m.workspace.ProjectName))
+	if m.workspace.IsGitRepo {
+		b.WriteString(fmt.Sprintf("  Git:     %s\n", m.workspace.GitRoot))
+	}
+	if len(m.workspace.Languages) > 0 {
+		b.WriteString(fmt.Sprintf("  Langs:   %s\n", strings.Join(m.workspace.Languages, ", ")))
+	}
+	if m.workspace.RoseRoot != "" {
+		b.WriteString(fmt.Sprintf("  Rose:    %s\n", m.workspace.RoseRoot))
+	}
+
+	if m.store != nil {
+		total, success, projects, langs, _ := m.store.GetStats()
+		b.WriteString("\n")
+		b.WriteString(HeaderSubStyle.Render("Learning Stats"))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  Experiences: %d total, %d successes\n", total, success))
+		b.WriteString(fmt.Sprintf("  Projects:    %d\n", projects))
+		if len(langs) > 0 {
+			var langList []string
+			for l, c := range langs {
+				langList = append(langList, fmt.Sprintf("%s(%d)", l, c))
+			}
+			b.WriteString(fmt.Sprintf("  Languages:   %s\n", strings.Join(langList, ", ")))
+		}
+	}
+
+	b.WriteString("\n")
 	b.WriteString(HelpStyle.Render("Press q or esc to return"))
+
+	return b.String()
+}
+
+func (m model) renderPermission() string {
+	var b strings.Builder
+
+	b.WriteString(WarnStyle.Render("🔒 Permission Required"))
+	b.WriteString("\n\n")
+	b.WriteString(fmt.Sprintf("Rose wants to access:\n  %s\n\n", m.permRef.Resolved))
+	b.WriteString("This path is outside the current project boundary.\n\n")
+	b.WriteString(HighlightStyle.Render("(y)") + " Allow once\n")
+	b.WriteString(HighlightStyle.Render("(a)") + " Always allow this session\n")
+	b.WriteString(HighlightStyle.Render("(n)") + " Deny\n")
 
 	return b.String()
 }
@@ -143,23 +209,50 @@ func (m model) renderMain() string {
 	header := lipgloss.JoinHorizontal(
 		lipgloss.Top,
 		HeaderStyle.Render("Rose"),
-		HeaderSubStyle.Render("  ·  coding assistant"),
+		HeaderSubStyle.Render("  ·  "),
 	)
 
 	modeTag := "chat"
 	if m.mode == modeCode {
 		modeTag = "code"
+	} else if m.mode == modeSelfReflect {
+		modeTag = "self"
 	}
 
-	statusLine := fmt.Sprintf(" %s | %s | %s",
+	selfAware := ""
+	if m.workspace.RoseRoot != "" && !m.workspace.IsInRoseProject() {
+		selfAware = " ✦"
+	}
+
+	statusLine := fmt.Sprintf(" %s%s | %s",
 		modeTag,
+		selfAware,
 		m.status,
-		HelpStyle.Render("ctrl+h help"),
 	)
 
 	viewportContent := m.viewport.View()
 	if viewportContent == "" {
-		viewportContent = "Welcome to Rose. Start by typing a message below.\n\nYou can ask questions, write code, or run commands.\nPress ctrl+h for help."
+		viewportContent = "Welcome to Rose.\n\n" +
+			"  ctrl+t  select model\n" +
+			"  ctrl+e  code mode\n" +
+			"  ctrl+s  self-improve (analyze own source)\n" +
+			"  ctrl+u  update Rose from git\n" +
+			"  ctrl+h  help\n" +
+			"  ctrl+c  quit\n"
+		if m.workspace.RoseRoot != "" && !m.workspace.IsInRoseProject() {
+			viewportContent += fmt.Sprintf("\n✦ Self-aware: running from %s\n   Source at %s\n",
+				m.workspace.ProjectName, m.workspace.RoseRoot)
+		}
+	}
+
+	phaseIndicator := ""
+	switch m.execPhase {
+	case phaseWaitingLLM:
+		phaseIndicator = m.spinner.View() + " thinking..."
+	case phaseExecuting:
+		phaseIndicator = m.spinner.View() + " executing..."
+	case phaseFixing:
+		phaseIndicator = m.spinner.View() + fmt.Sprintf(" fixing (attempt %d/5)...", m.fixAttempt)
 	}
 
 	content := lipgloss.JoinVertical(
@@ -167,10 +260,16 @@ func (m model) renderMain() string {
 		header,
 		StatusBarStyle.Render(statusLine),
 		viewportContent,
-		m.input.View(),
 	)
 
-	vpHeight := m.height - 12 - lipgloss.Height(header) - lipgloss.Height(statusLine)
+	if phaseIndicator != "" {
+		content = lipgloss.JoinVertical(lipgloss.Top, content,
+			lipgloss.NewStyle().Foreground(warnCol).Render(phaseIndicator))
+	}
+
+	content = lipgloss.JoinVertical(lipgloss.Top, content, m.input.View())
+
+	vpHeight := m.height - 14 - lipgloss.Height(header)
 	if vpHeight < 5 {
 		vpHeight = 5
 	}
