@@ -35,6 +35,9 @@ func (s *SelfImprover) ReadAllSource() ([]CodeFile, error) {
 			}
 			return nil
 		}
+		if strings.HasPrefix(info.Name(), "._") {
+			return nil
+		}
 		if !extensions[filepath.Ext(info.Name())] {
 			return nil
 		}
