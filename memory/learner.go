@@ -31,14 +31,18 @@ func (l *Learner) BuildContext(prompt string) *LearningContext {
 	}
 
 	for _, exp := range related {
+		projTag := ""
+		if exp.Project != "" {
+			projTag = fmt.Sprintf(" [from: %s]", exp.Project)
+		}
 		if exp.Success {
 			ctx.PastSuccesses = append(ctx.PastSuccesses,
-				fmt.Sprintf("Previously solved similar problem using %s:\n%s",
-					exp.Language, truncate(exp.Response, 300)))
+				fmt.Sprintf("- Previously solved similar problem%s using %s:\n  %s",
+					projTag, exp.Language, truncate(exp.Response, 300)))
 		} else {
 			ctx.PastErrors = append(ctx.PastErrors,
-				fmt.Sprintf("Previously failed with exit code %d in %s:\nstderr: %s",
-					exp.ExitCode, exp.Language, truncate(exp.Stderr, 200)))
+				fmt.Sprintf("- Previously failed%s with exit code %d in %s:\n  stderr: %s",
+					projTag, exp.ExitCode, exp.Language, truncate(exp.Stderr, 200)))
 		}
 	}
 
@@ -58,7 +62,11 @@ func (l *Learner) GetPatterns(language string) []string {
 	var patterns []string
 	for _, s := range successes {
 		if s.Language == language || language == "" {
-			patterns = append(patterns, s.Prompt+": "+truncate(s.Response, 100))
+			projTag := ""
+			if s.Project != "" {
+				projTag = fmt.Sprintf(" (@%s)", s.Project)
+			}
+			patterns = append(patterns, fmt.Sprintf("- %s%s", truncate(s.Response, 100), projTag))
 		}
 	}
 	return patterns
@@ -71,17 +79,11 @@ func (l *Learner) BuildPrompt(prompt, language string) string {
 	var parts []string
 	parts = append(parts, prompt)
 
-	if len(ctx.PastSuccesses) > 0 {
-		parts = append(parts,
-			"\n[Relevant past experiences with similar problems:]")
+	if len(ctx.PastSuccesses) > 0 || len(ctx.PastErrors) > 0 {
+		parts = append(parts, "\n[Learnings from past experiences (across all projects):]")
 		for _, s := range ctx.PastSuccesses {
 			parts = append(parts, s)
 		}
-	}
-
-	if len(ctx.PastErrors) > 0 {
-		parts = append(parts,
-			"\n[Previously seen errors to avoid:]")
 		for _, e := range ctx.PastErrors {
 			parts = append(parts, e)
 		}
@@ -89,7 +91,7 @@ func (l *Learner) BuildPrompt(prompt, language string) string {
 
 	if len(patterns) > 0 {
 		parts = append(parts,
-			fmt.Sprintf("\n[Known working patterns in %s:]", language))
+			fmt.Sprintf("\n[Known working patterns:]"))
 		for _, p := range patterns {
 			parts = append(parts, p)
 		}
@@ -99,8 +101,9 @@ func (l *Learner) BuildPrompt(prompt, language string) string {
 }
 
 func truncate(s string, max int) string {
-	if len(s) <= max {
+	runes := []rune(s)
+	if len(runes) <= max {
 		return s
 	}
-	return s[:max] + "..."
+	return string(runes[:max]) + "..."
 }
