@@ -11,12 +11,20 @@ import (
 	"github.com/ryanwi/rose/memory"
 	"github.com/ryanwi/rose/sandbox"
 	"github.com/ryanwi/rose/tui"
+	"github.com/ryanwi/rose/workspace"
 )
 
 func main() {
 	cfg := config.Default()
 	if err := cfg.Load(); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	ws := workspace.Detect()
+
+	if cfg.RoseRoot == "" && ws.RoseRoot != "" {
+		cfg.RoseRoot = ws.RoseRoot
+		cfg.Save()
 	}
 
 	store, err := memory.NewStore(cfg.HistoryPath())
@@ -32,7 +40,7 @@ func main() {
 	defer executor.Cleanup()
 
 	p := tea.NewProgram(
-		tui.InitialModel(cfg, store, executor),
+		tui.InitialModel(cfg, store, executor, ws),
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
