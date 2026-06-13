@@ -22,9 +22,11 @@ func main() {
 
 	ws := workspace.Detect()
 
-	if cfg.RoseRoot == "" && ws.RoseRoot != "" {
+	if ws.RoseRoot != "" && cfg.RoseRoot != ws.RoseRoot {
 		cfg.RoseRoot = ws.RoseRoot
 		cfg.Save()
+	} else if ws.RoseRoot == "" && cfg.RoseRoot != "" {
+		ws.RoseRoot = cfg.RoseRoot
 	}
 
 	store, err := memory.NewStore(cfg.HistoryPath())
