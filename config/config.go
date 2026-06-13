@@ -8,12 +8,13 @@ import (
 )
 
 type Config struct {
-	OllamaHost     string `json:"ollama_host"`
-	ActiveModel    string `json:"active_model"`
-	MaxTokens      int    `json:"max_tokens"`
+	OllamaHost     string  `json:"ollama_host"`
+	ActiveModel    string  `json:"active_model"`
+	MaxTokens      int     `json:"max_tokens"`
 	Temperature    float64 `json:"temperature"`
-	SandboxTimeout int    `json:"sandbox_timeout"`
-	DataDir        string `json:"data_dir"`
+	SandboxTimeout int     `json:"sandbox_timeout"`
+	DataDir        string  `json:"data_dir"`
+	RoseRoot       string  `json:"rose_root"`
 }
 
 func Default() *Config {
