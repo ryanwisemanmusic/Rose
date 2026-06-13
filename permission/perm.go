@@ -23,8 +23,8 @@ type Rule struct {
 }
 
 type Manager struct {
-	mu       sync.RWMutex
-	rules    []Rule
+	mu          sync.RWMutex
+	rules       []Rule
 	projectRoot string
 }
 
@@ -43,7 +43,7 @@ func (pm *Manager) CheckAccess(path string) (allowed bool, reason string) {
 		return false, "invalid path"
 	}
 
-	if !strings.HasPrefix(abs, pm.projectRoot) {
+	if !pm.contains(abs) {
 		for _, rule := range pm.rules {
 			if rule.Resource == abs && rule.State == AllowedSession {
 				return true, ""
@@ -64,7 +64,7 @@ func (pm *Manager) RequestAccess(path string) (needsPrompt bool, label string) {
 	abs, _ := filepath.Abs(path)
 	label = fmt.Sprintf("access %s", abs)
 
-	if !strings.HasPrefix(abs, pm.projectRoot) {
+	if !pm.contains(abs) {
 		return true, label
 	}
 	return false, ""
@@ -147,4 +147,16 @@ func (pm *Manager) ConsumeOnce(path string) {
 			return
 		}
 	}
+}
+
+func (pm *Manager) contains(path string) bool {
+	root, err := filepath.Abs(pm.projectRoot)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
 }
