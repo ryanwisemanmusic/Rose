@@ -7,15 +7,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
+
+type FileChange struct {
+	Path string
+	Kind string
+	Size int64
+}
 
 type Result struct {
 	Stdout   string
 	Stderr   string
 	ExitCode int
 	Duration time.Duration
+	WorkDir  string
+	Changes  []FileChange
 }
 
 type Executor struct {
@@ -52,8 +61,8 @@ func NewExecutor(timeoutSec int) (*Executor, error) {
 		return nil, fmt.Errorf("create sandbox dir: %w", err)
 	}
 	return &Executor{
-		WorkDir:  workDir,
-		Timeout:  time.Duration(timeoutSec) * time.Second,
+		WorkDir: workDir,
+		Timeout: time.Duration(timeoutSec) * time.Second,
 	}, nil
 }
 
@@ -74,11 +83,16 @@ func (e *Executor) ReadFile(name string) (string, error) {
 }
 
 func (e *Executor) Run(command string, args ...string) (*Result, error) {
+	return e.runInDir(e.WorkDir, command, args...)
+}
+
+func (e *Executor) runInDir(dir, command string, args ...string) (*Result, error) {
 	if blocked, reason := e.checkBlocked(command, args); blocked {
 		return &Result{
 			Stderr:   reason,
 			ExitCode: -3,
 			Duration: 0,
+			WorkDir:  dir,
 		}, nil
 	}
 
@@ -86,7 +100,8 @@ func (e *Executor) Run(command string, args ...string) (*Result, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, command, args...)
-	cmd.Dir = e.WorkDir
+	cmd.Dir = dir
+	cmd.Env = appleDoubleDisabledEnv()
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -112,6 +127,7 @@ func (e *Executor) Run(command string, args ...string) (*Result, error) {
 		Stderr:   stderr.String(),
 		ExitCode: exitCode,
 		Duration: duration,
+		WorkDir:  dir,
 	}, nil
 }
 
@@ -157,6 +173,50 @@ func (e *Executor) RunShell(code string, lang string) (*Result, error) {
 	default:
 		return nil, fmt.Errorf("unsupported language: %s", lang)
 	}
+}
+
+func (e *Executor) RunProjectShell(code string, projectRoot string) (*Result, error) {
+	root, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project root: %w", err)
+	}
+
+	before, err := snapshotFiles(root)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot project before execution: %w", err)
+	}
+
+	script, err := os.CreateTemp("", "rose-project-*.sh")
+	if err != nil {
+		return nil, fmt.Errorf("create project script: %w", err)
+	}
+	scriptPath := script.Name()
+	defer os.Remove(scriptPath)
+
+	if _, err := script.WriteString(code); err != nil {
+		script.Close()
+		return nil, fmt.Errorf("write project script: %w", err)
+	}
+	if err := script.Close(); err != nil {
+		return nil, fmt.Errorf("close project script: %w", err)
+	}
+	if err := os.Chmod(scriptPath, 0700); err != nil {
+		return nil, fmt.Errorf("chmod project script: %w", err)
+	}
+
+	result, err := e.runInDir(root, "bash", scriptPath)
+	if result == nil {
+		result = &Result{ExitCode: -2, WorkDir: root}
+	}
+	_ = cleanupAppleDouble(root)
+
+	after, snapErr := snapshotFiles(root)
+	if snapErr == nil {
+		result.Changes = diffSnapshots(before, after)
+	}
+	result.WorkDir = root
+
+	return result, err
 }
 
 func (e *Executor) DetectLanguage(code string) string {
@@ -255,4 +315,117 @@ func (e *Executor) Cleanup() error {
 		return nil
 	}
 	return os.RemoveAll(e.WorkDir)
+}
+
+type fileState struct {
+	Size    int64
+	Mode    os.FileMode
+	ModTime time.Time
+}
+
+var snapshotSkipDirs = map[string]bool{
+	".git":         true,
+	".next":        true,
+	"__pycache__":  true,
+	"build":        true,
+	"dist":         true,
+	"node_modules": true,
+	"target":       true,
+	"vendor":       true,
+}
+
+func appleDoubleDisabledEnv() []string {
+	env := os.Environ()
+	env = append(env,
+		"COPYFILE_DISABLE=1",
+		"COPY_EXTENDED_ATTRIBUTES_DISABLE=1",
+		"APPLEDOUBLE_DISABLE=1",
+	)
+	return env
+}
+
+func snapshotFiles(root string) (map[string]fileState, error) {
+	files := make(map[string]fileState)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			if path != root && snapshotSkipDirs[entry.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if isAppleDoubleName(entry.Name()) {
+			return nil
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil
+		}
+		files[filepath.ToSlash(rel)] = fileState{
+			Size:    info.Size(),
+			Mode:    info.Mode(),
+			ModTime: info.ModTime(),
+		}
+		return nil
+	})
+	return files, err
+}
+
+func isAppleDoubleName(name string) bool {
+	return strings.HasPrefix(name, "._")
+}
+
+func cleanupAppleDouble(root string) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			if path != root && snapshotSkipDirs[entry.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if isAppleDoubleName(entry.Name()) {
+			_ = os.Remove(path)
+		}
+		return nil
+	})
+}
+
+func diffSnapshots(before, after map[string]fileState) []FileChange {
+	var changes []FileChange
+
+	for path, next := range after {
+		prev, ok := before[path]
+		if !ok {
+			changes = append(changes, FileChange{Path: path, Kind: "created", Size: next.Size})
+			continue
+		}
+		if prev.Size != next.Size || !prev.ModTime.Equal(next.ModTime) || prev.Mode != next.Mode {
+			changes = append(changes, FileChange{Path: path, Kind: "modified", Size: next.Size})
+		}
+	}
+
+	for path := range before {
+		if _, ok := after[path]; !ok {
+			changes = append(changes, FileChange{Path: path, Kind: "deleted"})
+		}
+	}
+
+	sort.Slice(changes, func(i, j int) bool {
+		if changes[i].Path == changes[j].Path {
+			return changes[i].Kind < changes[j].Kind
+		}
+		return changes[i].Path < changes[j].Path
+	})
+
+	return changes
 }
