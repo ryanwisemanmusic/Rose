@@ -7,14 +7,16 @@ import (
 	"strings"
 )
 
+var BuildRoseRoot string
+
 type Context struct {
-	CurrentDir   string
-	ProjectName  string
-	ProjectRoot  string
-	IsGitRepo    bool
-	GitRoot      string
-	Languages    []string
-	RoseRoot     string
+	CurrentDir  string
+	ProjectName string
+	ProjectRoot string
+	IsGitRepo   bool
+	GitRoot     string
+	Languages   []string
+	RoseRoot    string
 }
 
 func Detect() *Context {
@@ -79,6 +81,9 @@ func detectLanguages(root string) []string {
 			}
 			return nil
 		}
+		if strings.HasPrefix(info.Name(), "._") {
+			return nil
+		}
 		ext := filepath.Ext(info.Name())
 		lang := extToLang(ext)
 		if lang != "" && !seen[lang] {
@@ -137,6 +142,8 @@ func findRoseRoot() string {
 	}
 
 	candidates := []string{
+		os.Getenv("ROSE_ROOT"),
+		BuildRoseRoot,
 		filepath.Dir(filepath.Dir(realPath)),
 		filepath.Dir(realPath),
 		filepath.Join(os.Getenv("HOME"), "Rose"),
@@ -144,6 +151,9 @@ func findRoseRoot() string {
 	}
 
 	for _, dir := range candidates {
+		if dir == "" {
+			continue
+		}
 		mainGo := filepath.Join(dir, "main.go")
 		if info, err := os.Stat(mainGo); err == nil && !info.IsDir() {
 			if goMod := filepath.Join(dir, "go.mod"); true {
