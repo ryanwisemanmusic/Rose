@@ -1,8 +1,10 @@
 BINARY=rose
 INSTALL_DIR=/usr/local/bin
+LDFLAGS=-X 'github.com/ryanwi/rose/workspace.BuildRoseRoot=$(CURDIR)'
 
 build:
-	go build -o $(BINARY) .
+	COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 APPLEDOUBLE_DISABLE=1 go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
+	rm -f ._$(BINARY)
 
 install: build
 	cp $(BINARY) $(INSTALL_DIR)/$(BINARY)
