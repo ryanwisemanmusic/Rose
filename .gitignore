@@ -5,3 +5,5 @@
 *.db
 *.db-journal
 *.db-wal
+._*
+**/._*
