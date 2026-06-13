@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/ryanwi/rose/memory"
 )
 
 type SelfImprover struct {
@@ -26,7 +28,6 @@ func (s *SelfImprover) ReadAllSource() ([]CodeFile, error) {
 	}
 
 	var files []CodeFile
-	extensions := map[string]bool{".go": true}
 
 	err := filepath.Walk(s.RoseRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -38,14 +39,15 @@ func (s *SelfImprover) ReadAllSource() ([]CodeFile, error) {
 		if strings.HasPrefix(info.Name(), "._") {
 			return nil
 		}
-		if !extensions[filepath.Ext(info.Name())] {
+		relPath, _ := filepath.Rel(s.RoseRoot, path)
+		relPath = filepath.ToSlash(relPath)
+		if filepath.Ext(info.Name()) != ".go" && relPath != memory.SystemMemoryRelPath {
 			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil
 		}
-		relPath, _ := filepath.Rel(s.RoseRoot, path)
 		files = append(files, CodeFile{Path: relPath, Content: string(data)})
 		return nil
 	})
@@ -157,10 +159,15 @@ You have the ability to:
 5. Learn from every interaction across all projects
 
 When you learn something valuable, consider:
-- Adding it to your memory/ directory
+- Adding it to memory/system.txt when it is a durable, generic lesson
 - Improving your prompting strategies
 - Fixing bugs in your own execution
 - Adding new capabilities to your sandbox
+
+Memory routing:
+- Durable system memories and coding lessons belong in memory/system.txt
+- Chat transcripts, project context, execution results, and code-fix experiences belong in ~/.rose/history.db
+- Do not edit memory/store.go just to add a memory; only edit it for database behavior changes
 
 Source tree:
 %s

@@ -1,0 +1,15 @@
+# Rose System Memory
+
+Purpose: this file stores durable, generic lessons for Rose itself. It is plain text on purpose so Rose can update memory without risking unrelated Go code.
+
+Memory routing:
+- Use this file for broad behavior, coding, prompting, and self-improvement lessons that should persist across projects.
+- Use ~/.rose/history.db for chat transcripts, project-specific context, execution results, and code-fix experiences.
+- Do not edit memory/store.go merely to record a new memory. Only edit Go storage code when the database behavior or schema itself must change.
+- Keep memories short, specific, and non-duplicative. Prefer replacing stale guidance over appending near-copies.
+
+Durable memories:
+- When asked to update Rose's memories, prefer a small edit to memory/system.txt unless the request requires code behavior changes.
+- Before proposing or applying code edits, read the relevant files and preserve the existing project style.
+- For local Ollama models, avoid keeping very large models resident indefinitely after prompts; use an explicit keep_alive policy.
+- Drive.

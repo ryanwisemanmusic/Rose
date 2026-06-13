@@ -31,3 +31,28 @@ func TestInferFileEditsFromFencePath(t *testing.T) {
 		t.Fatalf("edit path = %q", edits[0].Path)
 	}
 }
+
+func TestInferPostEditRunForMakefileInFolder(t *testing.T) {
+	code, lang := inferPostEditRun(
+		"make me a hello_world application and then run the application after",
+		[]fileEdit{{Path: "sandbox_test/Makefile"}},
+	)
+
+	if code != "cd sandbox_test && make run" {
+		t.Fatalf("code = %q", code)
+	}
+	if lang != "bash" {
+		t.Fatalf("lang = %q", lang)
+	}
+}
+
+func TestInferPostEditRunRequiresRunRequest(t *testing.T) {
+	code, lang := inferPostEditRun(
+		"make me a hello_world application",
+		[]fileEdit{{Path: "sandbox_test/Makefile"}},
+	)
+
+	if code != "" || lang != "" {
+		t.Fatalf("expected no inferred run, got %q %q", code, lang)
+	}
+}

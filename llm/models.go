@@ -1,10 +1,10 @@
 package llm
 
 type Model struct {
-	Name        string  `json:"name"`
-	Size        string  `json:"size"`
-	Description string  `json:"description"`
-	Capability  string  `json:"capability"`
+	Name        string `json:"name"`
+	Size        string `json:"size"`
+	Description string `json:"description"`
+	Capability  string `json:"capability"`
 }
 
 var KnownModels = []Model{
@@ -21,15 +21,17 @@ type Message struct {
 }
 
 type ChatRequest struct {
-	Model    string    `json:"model"`
-	Messages []Message `json:"messages"`
-	Stream   bool      `json:"stream"`
-	Options  Options   `json:"options,omitempty"`
+	Model     string    `json:"model"`
+	Messages  []Message `json:"messages"`
+	Stream    bool      `json:"stream"`
+	Options   Options   `json:"options,omitempty"`
+	KeepAlive string    `json:"keep_alive,omitempty"`
 }
 
 type Options struct {
 	Temperature float64 `json:"temperature"`
 	MaxTokens   int     `json:"num_predict"`
+	KeepAlive   string  `json:"-"`
 }
 
 type ChatResponse struct {

@@ -1,31 +1,41 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 )
 
+const (
+	DefaultActiveModel = "gemma3:12b"
+	oldDefaultModel    = "gemma3:27b"
+)
+
 type Config struct {
-	OllamaHost     string  `json:"ollama_host"`
-	ActiveModel    string  `json:"active_model"`
-	MaxTokens      int     `json:"max_tokens"`
-	Temperature    float64 `json:"temperature"`
-	SandboxTimeout int     `json:"sandbox_timeout"`
-	DataDir        string  `json:"data_dir"`
-	RoseRoot       string  `json:"rose_root"`
+	OllamaHost           string  `json:"ollama_host"`
+	OllamaKeepAlive      string  `json:"ollama_keep_alive"`
+	ActiveModel          string  `json:"active_model"`
+	DefaultModelMigrated bool    `json:"default_model_migrated"`
+	MaxTokens            int     `json:"max_tokens"`
+	Temperature          float64 `json:"temperature"`
+	SandboxTimeout       int     `json:"sandbox_timeout"`
+	DataDir              string  `json:"data_dir"`
+	RoseRoot             string  `json:"rose_root"`
 }
 
 func Default() *Config {
 	home, _ := os.UserHomeDir()
 	return &Config{
-		OllamaHost:     "http://localhost:11434",
-		ActiveModel:    "gemma3:27b",
-		MaxTokens:      4096,
-		Temperature:    0.7,
-		SandboxTimeout: 30,
-		DataDir:        filepath.Join(home, ".rose"),
+		OllamaHost:           "http://localhost:11434",
+		OllamaKeepAlive:      "0",
+		ActiveModel:          DefaultActiveModel,
+		DefaultModelMigrated: true,
+		MaxTokens:            4096,
+		Temperature:          0.7,
+		SandboxTimeout:       30,
+		DataDir:              filepath.Join(home, ".rose"),
 	}
 }
 
@@ -45,7 +55,14 @@ func (c *Config) Load() error {
 		}
 		return fmt.Errorf("read config: %w", err)
 	}
-	return json.Unmarshal(data, c)
+	hadDefaultModelMigration := bytes.Contains(data, []byte(`"default_model_migrated"`))
+	if err := json.Unmarshal(data, c); err != nil {
+		return err
+	}
+	if c.applyLoadedDefaults(hadDefaultModelMigration) {
+		return c.Save()
+	}
+	return nil
 }
 
 func (c *Config) Save() error {
@@ -57,4 +74,44 @@ func (c *Config) Save() error {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 	return os.WriteFile(c.Path(), data, 0644)
+}
+
+func (c *Config) applyLoadedDefaults(hadDefaultModelMigration bool) bool {
+	changed := false
+	home, _ := os.UserHomeDir()
+
+	if c.OllamaHost == "" {
+		c.OllamaHost = "http://localhost:11434"
+		changed = true
+	}
+	if c.OllamaKeepAlive == "" {
+		c.OllamaKeepAlive = "0"
+		changed = true
+	}
+	if c.ActiveModel == "" {
+		c.ActiveModel = DefaultActiveModel
+		changed = true
+	}
+	if !hadDefaultModelMigration && c.ActiveModel == oldDefaultModel {
+		c.ActiveModel = DefaultActiveModel
+		changed = true
+	}
+	if !c.DefaultModelMigrated {
+		c.DefaultModelMigrated = true
+		changed = true
+	}
+	if c.MaxTokens == 0 {
+		c.MaxTokens = 4096
+		changed = true
+	}
+	if c.SandboxTimeout == 0 {
+		c.SandboxTimeout = 30
+		changed = true
+	}
+	if c.DataDir == "" {
+		c.DataDir = filepath.Join(home, ".rose")
+		changed = true
+	}
+
+	return changed
 }

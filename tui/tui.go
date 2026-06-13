@@ -173,11 +173,20 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 	b.WriteString("\n## Self-Awareness & Learning\n")
 	b.WriteString("- You learn from every interaction across ALL projects\n")
 	b.WriteString("- Knowledge is stored globally in ~/.rose/history.db\n")
+	b.WriteString("- Durable system memories are stored as plain text in memory/system.txt\n")
+	b.WriteString("- When asked to update memories, update memory/system.txt for generic lessons and keep project/chat details in SQLite\n")
+	b.WriteString("- Do not edit memory/store.go just to add a memory; only edit it for storage behavior or schema changes\n")
 	b.WriteString("- Past successes AND failures are retrieved to inform future responses\n")
 	b.WriteString("- When code fails, read the error and fix it automatically\n")
 	if ws.RoseRoot != "" {
 		b.WriteString(fmt.Sprintf("- Your source code is at: %s\n", ws.RoseRoot))
 		b.WriteString("- You can propose improvements to your own code\n")
+	}
+
+	if systemMemory, err := memory.LoadSystemMemory(ws.RoseRoot); err == nil && systemMemory != "" {
+		b.WriteString("\n## Durable System Memory\n")
+		b.WriteString(systemMemory)
+		b.WriteString("\n")
 	}
 
 	b.WriteString("\n## Reference System\n")
@@ -192,12 +201,14 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 	b.WriteString("3. If execution fails, the error is returned to you\n")
 	b.WriteString("4. Fix the code and the system will re-execute\n")
 	b.WriteString("5. This repeats until success or max attempts reached\n")
+	b.WriteString("6. When the user explicitly asks you to run, test, verify, or execute something, emit a ```bash block with the terminal command to run\n")
 
 	b.WriteString("\n## File Editing Protocol\n")
 	b.WriteString("- When creating or editing project files, emit fenced blocks with paths, for example ```path=sandbox_test/hello_world.cpp\n")
 	b.WriteString("- Use one fenced block per file and include the complete desired file content\n")
 	b.WriteString("- Do not claim files were created unless you emitted file blocks for them\n")
 	b.WriteString("- If you also need to test the files, add a separate ```bash block after the file blocks\n")
+	b.WriteString("- When generating Makefiles, include a `run` target; verify Makefile projects with `make run` or `cd subdir && make run`\n")
 
 	b.WriteString("\n## Learning Strategy\n")
 	b.WriteString("- Abstract patterns: learn language-agnostic solutions\n")
@@ -453,6 +464,30 @@ Please fix the code. Output ONLY the corrected code block. Do not explain.
 			m.config.ActiveModel, len(msg.edits), m.workspace.Summary())
 		return m, nil
 
+	case systemMemoryUpdateMsg:
+		m.execPhase = phaseIdle
+		m.mode = modeChat
+		m.input.Placeholder = "Ask Rose anything... (@path for context)"
+		if msg.err != nil {
+			m.err = msg.err
+			m.messages[m.inFlightMsgIdx].content = fmt.Sprintf("Error updating %s: %s", memory.SystemMemoryRelPath, msg.err)
+			m.saveChat("assistant", m.messages[m.inFlightMsgIdx].content, "", -1)
+			m.status = fmt.Sprintf("model: %s | memory update failed", m.config.ActiveModel)
+		} else {
+			content := fmt.Sprintf("Updated `%s`:\n%s", memory.SystemMemoryRelPath, msg.line)
+			m.messages[m.inFlightMsgIdx].content = content
+			m.saveChat("assistant", content, "", 0)
+			m.conversation[0] = llm.Message{Role: "system", Content: buildSystemPrompt(m.config.ActiveModel, m.workspace, m.improver)}
+			m.conversation = append(m.conversation,
+				llm.Message{Role: "user", Content: m.currentPrompt},
+				llm.Message{Role: "assistant", Content: content},
+			)
+			m.status = fmt.Sprintf("model: %s | updated system memory | %s", m.config.ActiveModel, m.workspace.Summary())
+		}
+		m.viewport.SetContent(m.renderMessages())
+		m.viewport.GotoBottom()
+		return m, nil
+
 	case errorMsg:
 		m.execPhase = phaseIdle
 		m.err = msg.err
@@ -551,6 +586,19 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.input.SetValue("")
 		m.refPicker.Close()
+
+		if line, ok := memory.SystemMemoryLineFromRequest(text); ok {
+			m.messages = append(m.messages, message{role: "user", content: text})
+			m.saveChat("user", text, "", 0)
+			m.messages = append(m.messages, message{role: "assistant", content: ""})
+			m.inFlightMsgIdx = len(m.messages) - 1
+			m.currentPrompt = text
+			m.execPhase = phaseExecuting
+			m.viewport.SetContent(m.renderMessages())
+			m.viewport.GotoBottom()
+			m.status = "updating system memory..."
+			return m, m.updateSystemMemory(line)
+		}
 
 		resolved, refs, err := m.referencer.ResolveAll(text)
 		if err == nil && len(refs) > 0 {
@@ -664,8 +712,14 @@ func (m model) updateSelfReflect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.saveChat("user", "[self-improve] "+text, "", 0)
 		m.messages = append(m.messages, message{role: "assistant", content: ""})
 		m.inFlightMsgIdx = len(m.messages) - 1
+		m.currentPrompt = text
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
+		if line, ok := memory.SystemMemoryLineFromRequest(text); ok {
+			m.execPhase = phaseExecuting
+			m.status = "updating system memory..."
+			return m, m.updateSystemMemory(line)
+		}
 		m.status = "analyzing own source..."
 		return m, m.selfReflect(text)
 	}
@@ -743,6 +797,7 @@ func (m model) updateModelSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter":
 		selected := m.availModels[m.cursor].Name
 		m.config.ActiveModel = selected
+		m.config.DefaultModelMigrated = true
 		m.config.Save()
 		m.conversation[0] = llm.Message{Role: "system", Content: buildSystemPrompt(selected, m.workspace, m.improver)}
 		m.mode = modeChat
@@ -759,6 +814,7 @@ func (m model) streamLLM() tea.Cmd {
 			llm.Options{
 				Temperature: m.config.Temperature,
 				MaxTokens:   m.config.MaxTokens,
+				KeepAlive:   m.config.OllamaKeepAlive,
 			},
 			func(chunk string) error { return nil },
 		)
@@ -797,6 +853,9 @@ func (m model) executeCurrent() tea.Cmd {
 }
 
 func (m model) applyFileEdits(edits []fileEdit, runCode, runLang string) tea.Cmd {
+	if runCode == "" || runLang == "" {
+		runCode, runLang = inferPostEditRun(m.currentPrompt, edits)
+	}
 	return func() tea.Msg {
 		applied, changes, err := applyProjectFileEdits(m.workspace.ProjectRoot, edits)
 		return editResultMsg{
@@ -806,6 +865,20 @@ func (m model) applyFileEdits(edits []fileEdit, runCode, runLang string) tea.Cmd
 			runCode: runCode,
 			runLang: runLang,
 		}
+	}
+}
+
+func (m model) updateSystemMemory(line string) tea.Cmd {
+	roseRoot := m.config.RoseRoot
+	if roseRoot == "" {
+		roseRoot = m.workspace.RoseRoot
+	}
+	return func() tea.Msg {
+		if roseRoot == "" {
+			return systemMemoryUpdateMsg{err: fmt.Errorf("rose root not set")}
+		}
+		written, err := memory.AppendSystemMemory(roseRoot, line)
+		return systemMemoryUpdateMsg{line: written, err: err}
 	}
 }
 
@@ -819,6 +892,7 @@ func (m model) selfReflect(query string) tea.Cmd {
 		var ctx strings.Builder
 		ctx.WriteString(m.improver.BuildContext())
 		ctx.WriteString(fmt.Sprintf("\n\nUser request: %s", query))
+		ctx.WriteString("\n\nIf the request is to update Rose's memories, prefer editing memory/system.txt with concise durable lessons. Do not edit memory/store.go unless the storage schema or behavior itself must change.")
 		ctx.WriteString("\n\nPropose specific code changes with file paths and content.")
 
 		prompt := []llm.Message{
@@ -828,7 +902,7 @@ func (m model) selfReflect(query string) tea.Cmd {
 
 		result, err := m.llmClient.Chat(
 			m.config.ActiveModel, prompt,
-			llm.Options{Temperature: 0.4, MaxTokens: 4096}, nil,
+			llm.Options{Temperature: 0.4, MaxTokens: 4096, KeepAlive: m.config.OllamaKeepAlive}, nil,
 		)
 		if err != nil {
 			return llmStreamMsg{done: true, full: fmt.Sprintf("Error: %s", err)}
@@ -884,6 +958,11 @@ type editResultMsg struct {
 	err     error
 	runCode string
 	runLang string
+}
+
+type systemMemoryUpdateMsg struct {
+	line string
+	err  error
 }
 
 type selfApplyMsg struct {

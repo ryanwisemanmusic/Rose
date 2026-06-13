@@ -289,6 +289,62 @@ func applyProjectFileEdits(projectRoot string, edits []fileEdit) ([]appliedEdit,
 	return applied, changes, nil
 }
 
+func inferPostEditRun(prompt string, edits []fileEdit) (string, string) {
+	if !promptRequestsRun(prompt) {
+		return "", ""
+	}
+
+	for _, edit := range edits {
+		if filepath.Base(edit.Path) != "Makefile" {
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(edit.Path))
+		if dir == "." || dir == "" {
+			return "make run", "bash"
+		}
+		return fmt.Sprintf("cd %s && make run", shellQuote(dir)), "bash"
+	}
+
+	return "", ""
+}
+
+func promptRequestsRun(prompt string) bool {
+	lower := strings.ToLower(prompt)
+	for _, phrase := range []string{
+		"run it",
+		"run the",
+		"run after",
+		"then run",
+		"and run",
+		"execute it",
+		"execute the",
+		"verify",
+		"test it",
+		"test the",
+		"make sure it works",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if strings.IndexFunc(s, func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '/' || r == '_' || r == '-' || r == '.')
+	}) == -1 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
 func cleanupAppleDoubleForFile(path string) {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)

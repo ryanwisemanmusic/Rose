@@ -131,6 +131,7 @@ func (m model) renderHelp() string {
 		{"ctrl+l", "Clear conversation"},
 		{"ctrl+h", "Show this help"},
 		{"tab", "Execute raw code in input"},
+		{"cmd+c/v", "Copy selected terminal text / paste"},
 		{"esc", "Cancel/interrupt"},
 		{"ctrl+c", "Quit"},
 	}
@@ -250,6 +251,8 @@ func (m model) renderMain() string {
 			"  ctrl+s  self-improve (analyze own source)\n" +
 			"  ctrl+u  update Rose from git\n" +
 			"  ctrl+h  help\n" +
+			"  cmd+c  copy selected terminal text\n" +
+			"  cmd+v  paste\n" +
 			"  ctrl+c  quit\n"
 		if m.workspace.RoseRoot != "" && !m.workspace.IsInRoseProject() {
 			viewportContent += fmt.Sprintf("\n✦ Self-aware: running from %s\n   Source at %s\n",

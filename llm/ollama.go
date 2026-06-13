@@ -22,10 +22,11 @@ func NewClient(host string) *Client {
 
 func (c *Client) Chat(model string, messages []Message, opts Options, cb StreamCallback) (string, error) {
 	req := ChatRequest{
-		Model:    model,
-		Messages: messages,
-		Stream:   cb != nil,
-		Options:  opts,
+		Model:     model,
+		Messages:  messages,
+		Stream:    cb != nil,
+		Options:   opts,
+		KeepAlive: opts.KeepAlive,
 	}
 
 	body, err := json.Marshal(req)

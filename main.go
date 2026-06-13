@@ -44,7 +44,6 @@ func main() {
 	p := tea.NewProgram(
 		tui.InitialModel(cfg, store, executor, ws),
 		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
 	)
 
 	if _, err := p.Run(); err != nil {
