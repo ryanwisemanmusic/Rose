@@ -1,0 +1,7 @@
+/rose
+/rose.exe
+.vscode/
+.idea/
+*.db
+*.db-journal
+*.db-wal
