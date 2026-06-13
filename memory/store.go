@@ -11,6 +11,8 @@ import (
 
 type Entry struct {
 	ID        int64
+	SessionID string
+	Project   string
 	Role      string
 	Content   string
 	Language  string
@@ -19,18 +21,19 @@ type Entry struct {
 }
 
 type Experience struct {
-	ID          int64
-	Prompt      string
-	Response    string
-	Code        string
-	Language    string
-	ExitCode    int
-	Stdout      string
-	Stderr      string
-	Success     bool
-	Project     string
-	RelatedID   int64
-	CreatedAt   time.Time
+	ID        int64
+	Prompt    string
+	Response  string
+	Code      string
+	Language  string
+	ExitCode  int
+	Stdout    string
+	Stderr    string
+	Changes   string
+	Success   bool
+	Project   string
+	RelatedID int64
+	CreatedAt time.Time
 }
 
 type Store struct {
@@ -60,14 +63,27 @@ func (s *Store) migrate() error {
 			exit_code INTEGER NOT NULL DEFAULT 0,
 			stdout TEXT NOT NULL DEFAULT '',
 			stderr TEXT NOT NULL DEFAULT '',
+			changes TEXT NOT NULL DEFAULT '',
 			success INTEGER NOT NULL DEFAULT 0,
 			project TEXT NOT NULL DEFAULT '',
 			related_id INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS chat_entries (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			project TEXT NOT NULL DEFAULT '',
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			language TEXT NOT NULL DEFAULT '',
+			exit_code INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
 		`CREATE INDEX IF NOT EXISTS idx_experiences_prompt ON experiences(prompt)`,
 		`CREATE INDEX IF NOT EXISTS idx_experiences_language ON experiences(language)`,
 		`CREATE INDEX IF NOT EXISTS idx_experiences_exit ON experiences(exit_code)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_entries_session ON chat_entries(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_entries_project ON chat_entries(project)`,
 	}
 	for _, q := range queries {
 		if _, err := s.db.Exec(q); err != nil {
@@ -75,32 +91,76 @@ func (s *Store) migrate() error {
 		}
 	}
 
-	s.db.Exec(`ALTER TABLE experiences ADD COLUMN project TEXT`)
+	if err := s.addColumnIfMissing("experiences", "project", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("experiences", "changes", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_experiences_project ON experiences(project)`); err != nil {
-		if !strings.Contains(err.Error(), "no such column") {
-			return err
-		}
+		return err
 	}
 
 	return nil
 }
 
 func (s *Store) SaveExperience(prompt, response, code, language, stdout, stderr string, exitCode int, project string, relatedID int64) error {
+	return s.SaveExperienceWithChanges(prompt, response, code, language, stdout, stderr, "", exitCode, project, relatedID)
+}
+
+func (s *Store) SaveExperienceWithChanges(prompt, response, code, language, stdout, stderr, changes string, exitCode int, project string, relatedID int64) error {
 	success := 0
 	if exitCode == 0 {
 		success = 1
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO experiences (prompt, response, code, language, exit_code, stdout, stderr, success, project, related_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		prompt, response, code, language, exitCode, stdout, stderr, success, project, relatedID,
+		`INSERT INTO experiences (prompt, response, code, language, exit_code, stdout, stderr, changes, success, project, related_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		prompt, response, code, language, exitCode, stdout, stderr, changes, success, project, relatedID,
 	)
 	return err
 }
 
+func (s *Store) SaveMessage(sessionID, project, role, content, language string, exitCode int) error {
+	_, err := s.db.Exec(
+		`INSERT INTO chat_entries (session_id, project, role, content, language, exit_code)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		sessionID, project, role, content, language, exitCode,
+	)
+	return err
+}
+
+func (s *Store) RecentEntries(project string, limit int) ([]Entry, error) {
+	rows, err := s.db.Query(
+		`SELECT id, session_id, project, role, content, language, exit_code, created_at
+		 FROM chat_entries
+		 WHERE (? = '' OR project = ?)
+		 ORDER BY created_at DESC
+		 LIMIT ?`,
+		project, project, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []Entry
+	for rows.Next() {
+		var e Entry
+		var createdAt string
+		if err := rows.Scan(&e.ID, &e.SessionID, &e.Project, &e.Role, &e.Content,
+			&e.Language, &e.ExitCode, &createdAt); err != nil {
+			continue
+		}
+		e.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
 func (s *Store) FindSimilar(prompt string, limit int) ([]Experience, error) {
 	rows, err := s.db.Query(
-		`SELECT id, prompt, response, code, language, exit_code, stdout, stderr, success, project, related_id, created_at
+		`SELECT id, prompt, response, code, language, exit_code, stdout, stderr, changes, success, project, related_id, created_at
 		 FROM experiences
 		 WHERE prompt LIKE ? OR code LIKE ?
 		 ORDER BY created_at DESC
@@ -119,7 +179,7 @@ func (s *Store) FindSimilar(prompt string, limit int) ([]Experience, error) {
 		var e Experience
 		var createdAt string
 		if err := rows.Scan(&e.ID, &e.Prompt, &e.Response, &e.Code, &e.Language,
-			&e.ExitCode, &e.Stdout, &e.Stderr, &e.Success, &e.Project, &e.RelatedID, &createdAt); err != nil {
+			&e.ExitCode, &e.Stdout, &e.Stderr, &e.Changes, &e.Success, &e.Project, &e.RelatedID, &createdAt); err != nil {
 			continue
 		}
 		e.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
@@ -130,7 +190,7 @@ func (s *Store) FindSimilar(prompt string, limit int) ([]Experience, error) {
 
 func (s *Store) FindByExitCode(exitCode int, limit int) ([]Experience, error) {
 	rows, err := s.db.Query(
-		`SELECT id, prompt, response, code, language, exit_code, stdout, stderr, success, project, related_id, created_at
+		`SELECT id, prompt, response, code, language, exit_code, stdout, stderr, changes, success, project, related_id, created_at
 		 FROM experiences WHERE exit_code = ? ORDER BY created_at DESC LIMIT ?`,
 		exitCode, limit,
 	)
@@ -144,7 +204,7 @@ func (s *Store) FindByExitCode(exitCode int, limit int) ([]Experience, error) {
 		var e Experience
 		var createdAt string
 		if err := rows.Scan(&e.ID, &e.Prompt, &e.Response, &e.Code, &e.Language,
-			&e.ExitCode, &e.Stdout, &e.Stderr, &e.Success, &e.Project, &e.RelatedID, &createdAt); err != nil {
+			&e.ExitCode, &e.Stdout, &e.Stderr, &e.Changes, &e.Success, &e.Project, &e.RelatedID, &createdAt); err != nil {
 			continue
 		}
 		e.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
@@ -155,7 +215,7 @@ func (s *Store) FindByExitCode(exitCode int, limit int) ([]Experience, error) {
 
 func (s *Store) FindByProject(project string, limit int) ([]Experience, error) {
 	rows, err := s.db.Query(
-		`SELECT id, prompt, response, code, language, exit_code, stdout, stderr, success, project, related_id, created_at
+		`SELECT id, prompt, response, code, language, exit_code, stdout, stderr, changes, success, project, related_id, created_at
 		 FROM experiences WHERE project = ? ORDER BY created_at DESC LIMIT ?`,
 		project, limit,
 	)
@@ -169,7 +229,7 @@ func (s *Store) FindByProject(project string, limit int) ([]Experience, error) {
 		var e Experience
 		var createdAt string
 		if err := rows.Scan(&e.ID, &e.Prompt, &e.Response, &e.Code, &e.Language,
-			&e.ExitCode, &e.Stdout, &e.Stderr, &e.Success, &e.Project, &e.RelatedID, &createdAt); err != nil {
+			&e.ExitCode, &e.Stdout, &e.Stderr, &e.Changes, &e.Success, &e.Project, &e.RelatedID, &createdAt); err != nil {
 			continue
 		}
 		e.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
@@ -206,4 +266,12 @@ func (s *Store) GetStats() (total int, success int, projects int, langs map[stri
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+func (s *Store) addColumnIfMissing(table, column, definition string) error {
+	_, err := s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, definition))
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return err
+	}
+	return nil
 }
