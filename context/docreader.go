@@ -34,6 +34,9 @@ func (d *DocReader) SearchDocs(name string) ([]string, error) {
 				}
 				return nil
 			}
+			if strings.HasPrefix(entry.Name(), "._") {
+				return nil
+			}
 			if strings.Contains(strings.ToLower(entry.Name()), strings.ToLower(name)) {
 				if !seen[path] {
 					seen[path] = true
@@ -52,12 +55,12 @@ func (d *DocReader) SearchDocs(name string) ([]string, error) {
 
 func (d *DocReader) FindDocPaths(language string) ([]string, error) {
 	langDirs := map[string][]string{
-		"zig":         {"/opt/homebrew/opt/zig"},
-		"go":          {"/opt/homebrew/opt/go"},
-		"rust":        {"/opt/homebrew/opt/rust"},
-		"typescript":  {"/opt/homebrew/opt/node"},
-		"javascript":  {"/opt/homebrew/opt/node"},
-		"python":      {"/opt/homebrew/opt/python"},
+		"zig":        {"/opt/homebrew/opt/zig"},
+		"go":         {"/opt/homebrew/opt/go"},
+		"rust":       {"/opt/homebrew/opt/rust"},
+		"typescript": {"/opt/homebrew/opt/node"},
+		"javascript": {"/opt/homebrew/opt/node"},
+		"python":     {"/opt/homebrew/opt/python"},
 	}
 
 	lang := strings.ToLower(language)
@@ -77,11 +80,11 @@ func (d *DocReader) FindDocPaths(language string) ([]string, error) {
 
 func (d *DocReader) GetVersion(language string) string {
 	paths := map[string]string{
-		"zig":         "/opt/homebrew/opt/zig/bin/zig",
-		"go":          "/opt/homebrew/opt/go/bin/go",
-		"rust":        "/opt/homebrew/opt/rust/bin/rustc",
-		"node":        "/opt/homebrew/opt/node/bin/node",
-		"python":      "/opt/homebrew/opt/python/bin/python3",
+		"zig":    "/opt/homebrew/opt/zig/bin/zig",
+		"go":     "/opt/homebrew/opt/go/bin/go",
+		"rust":   "/opt/homebrew/opt/rust/bin/rustc",
+		"node":   "/opt/homebrew/opt/node/bin/node",
+		"python": "/opt/homebrew/opt/python/bin/python3",
 	}
 	bin, ok := paths[strings.ToLower(language)]
 	if !ok {
@@ -139,6 +142,9 @@ func FindDocsInPrefix(prefix string, extensions []string, max int) ([]string, er
 	var results []string
 	err := filepath.WalkDir(prefix, func(path string, entry os.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(entry.Name(), "._") {
 			return nil
 		}
 		if len(results) >= max {

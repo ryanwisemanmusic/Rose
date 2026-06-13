@@ -113,7 +113,11 @@ func (r *Referencer) contained(path string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.HasPrefix(abs, proj)
+	rel, err := filepath.Rel(proj, abs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel))
 }
 
 func (r *Referencer) resolveUnchecked(original, path string) Reference {
@@ -153,6 +157,9 @@ func (r *Referencer) readDir(path string) (Reference, error) {
 	b.WriteString("\n")
 
 	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "._") {
+			continue
+		}
 		info, _ := e.Info()
 		size := ""
 		if info != nil {
