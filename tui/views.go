@@ -9,30 +9,27 @@ import (
 
 func (m model) renderMessages() string {
 	var b strings.Builder
+	messageStyle := m.messageStyle()
 
 	for _, msg := range m.messages {
 		switch msg.role {
 		case "user":
 			b.WriteString(UserTagStyle.Render("▶ You"))
 			b.WriteString("\n")
-			b.WriteString(MessageStyle.Render(msg.content))
+			b.WriteString(messageStyle.Render(colorReferenceTokens(msg.content)))
 		case "assistant":
+			if strings.TrimSpace(msg.content) == "" {
+				continue
+			}
 			b.WriteString(AssistantTagStyle.Render("● Rose"))
 			b.WriteString("\n")
-			b.WriteString(MessageStyle.Render(renderContent(msg.content)))
+			b.WriteString(messageStyle.Render(renderContent(msg.content)))
 		case "system":
 			b.WriteString(SystemTagStyle.Render("◆ System"))
 			b.WriteString("\n")
-			b.WriteString(MessageStyle.Render(msg.content))
+			b.WriteString(messageStyle.Render(msg.content))
 		}
 		b.WriteString("\n\n")
-	}
-
-	if m.execPhase != phaseIdle && len(m.messages) > 0 && m.messages[len(m.messages)-1].role == "assistant" && m.messages[len(m.messages)-1].content == "" {
-		b.WriteString(AssistantTagStyle.Render("● Rose"))
-		b.WriteString("\n")
-		b.WriteString(m.spinner.View())
-		b.WriteString("\n")
 	}
 
 	return b.String()
@@ -206,6 +203,8 @@ func (m model) renderPermission() string {
 }
 
 func (m model) renderMain() string {
+	m.resizeComponents()
+	innerWidth := m.innerWidth()
 	header := lipgloss.JoinHorizontal(
 		lipgloss.Top,
 		HeaderStyle.Render("Rose"),
@@ -224,11 +223,24 @@ func (m model) renderMain() string {
 		selfAware = " ✦"
 	}
 
+	displayStatus := m.status
+	if phase := m.phaseStatus(); phase != "" {
+		displayStatus = fmt.Sprintf("model: %s | %s | %s", m.config.ActiveModel, phase, m.workspace.Summary())
+	}
+
 	statusLine := fmt.Sprintf(" %s%s | %s",
 		modeTag,
 		selfAware,
-		m.status,
+		displayStatus,
 	)
+	statusWidth := max(1, innerWidth-StatusBarStyle.GetHorizontalFrameSize())
+	statusLine = fitLine(statusLine, statusWidth)
+
+	vpHeight := m.availableViewportHeight(lipgloss.Height(header))
+	if vpHeight < 5 {
+		vpHeight = 5
+	}
+	m.viewport.Height = vpHeight
 
 	viewportContent := m.viewport.View()
 	if viewportContent == "" {
@@ -245,35 +257,140 @@ func (m model) renderMain() string {
 		}
 	}
 
-	phaseIndicator := ""
-	switch m.execPhase {
-	case phaseWaitingLLM:
-		phaseIndicator = m.spinner.View() + " thinking..."
-	case phaseExecuting:
-		phaseIndicator = m.spinner.View() + " executing..."
-	case phaseFixing:
-		phaseIndicator = m.spinner.View() + fmt.Sprintf(" fixing (attempt %d/5)...", m.fixAttempt)
-	}
-
 	content := lipgloss.JoinVertical(
 		lipgloss.Top,
 		header,
-		StatusBarStyle.Render(statusLine),
+		styleForTotalWidth(StatusBarStyle, innerWidth).Render(statusLine),
 		viewportContent,
 	)
 
-	if phaseIndicator != "" {
-		content = lipgloss.JoinVertical(lipgloss.Top, content,
-			lipgloss.NewStyle().Foreground(warnCol).Render(phaseIndicator))
+	content = lipgloss.JoinVertical(lipgloss.Top, content, m.renderComposer())
+
+	return content
+}
+
+func (m *model) resizeComponents() {
+	innerWidth := m.innerWidth()
+	m.viewport.Width = innerWidth
+
+	inputWidth := innerWidth - InputStyle.GetHorizontalFrameSize()
+	if inputWidth < 1 {
+		inputWidth = 1
 	}
+	m.input.SetWidth(inputWidth)
 
-	content = lipgloss.JoinVertical(lipgloss.Top, content, m.input.View())
+	inputHeight := 3
+	if m.height > 36 {
+		inputHeight = 4
+	}
+	if m.height > 50 {
+		inputHeight = 5
+	}
+	m.input.SetHeight(inputHeight)
 
-	vpHeight := m.height - 14 - lipgloss.Height(header)
+	vpHeight := m.availableViewportHeight(2)
 	if vpHeight < 5 {
 		vpHeight = 5
 	}
 	m.viewport.Height = vpHeight
+}
 
-	return content
+func (m model) innerWidth() int {
+	width := m.width
+	if width <= 0 {
+		width = 86
+	}
+	inner := width - AppStyle.GetHorizontalFrameSize()
+	if inner < 24 {
+		inner = 24
+	}
+	return inner
+}
+
+func (m model) renderComposer() string {
+	picker := m.renderReferencePicker()
+	input := m.renderInput()
+	if picker == "" {
+		return input
+	}
+	return lipgloss.JoinVertical(lipgloss.Top, picker, input)
+}
+
+func (m model) renderInput() string {
+	return styleForTotalWidth(InputStyle, m.innerWidth()).Render(m.input.View())
+}
+
+func (m model) availableViewportHeight(headerHeight int) int {
+	height := m.height
+	if height <= 0 {
+		height = 28
+	}
+	innerHeight := height - AppStyle.GetVerticalFrameSize()
+	statusHeight := 1
+	gap := 1
+	return innerHeight - headerHeight - statusHeight - m.composerHeight() - gap
+}
+
+func (m model) composerHeight() int {
+	height := m.input.Height() + InputStyle.GetVerticalFrameSize()
+	if picker := m.renderReferencePicker(); picker != "" {
+		height += lipgloss.Height(picker)
+	}
+	return height
+}
+
+func (m model) messageStyle() lipgloss.Style {
+	width := m.viewport.Width
+	if width <= 0 {
+		width = m.innerWidth()
+	}
+	width -= m.viewport.Style.GetHorizontalFrameSize()
+	if width < 1 {
+		width = 1
+	}
+	return styleForTotalWidth(MessageStyle, width)
+}
+
+func styleForTotalWidth(style lipgloss.Style, totalWidth int) lipgloss.Style {
+	contentWidth := totalWidth - style.GetHorizontalFrameSize()
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
+	return style.Width(contentWidth).MaxWidth(contentWidth)
+}
+
+func fitLine(s string, width int) string {
+	if width <= 0 || lipgloss.Width(s) <= width {
+		return s
+	}
+	if width <= 3 {
+		runes := []rune(s)
+		if len(runes) <= width {
+			return s
+		}
+		return string(runes[:width])
+	}
+	suffix := "..."
+	var b strings.Builder
+	for _, r := range s {
+		next := b.String() + string(r)
+		if lipgloss.Width(next)+len(suffix) > width {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String() + suffix
+}
+
+func (m model) phaseStatus() string {
+	switch m.execPhase {
+	case phaseWaitingLLM:
+		return m.spinner.View() + " thinking..."
+	case phaseExecuting:
+		return m.spinner.View() + " working..."
+	case phaseFixing:
+		return m.spinner.View() + fmt.Sprintf(" fixing (attempt %d/5)...", m.fixAttempt)
+	default:
+		return ""
+	}
 }

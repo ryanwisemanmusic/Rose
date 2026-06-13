@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -57,18 +59,18 @@ type model struct {
 	referencer *context.Referencer
 	docReader  *context.DocReader
 
-	width      int
-	height     int
-	mode       mode
-	execPhase  execPhase
+	width     int
+	height    int
+	mode      mode
+	execPhase execPhase
 
-	messages   []message
-	viewport   viewport.Model
-	input      textinput.Model
-	spinner    spinner.Model
+	messages []message
+	viewport viewport.Model
+	input    textarea.Model
+	spinner  spinner.Model
 
-	status     string
-	err        error
+	status string
+	err    error
 
 	permMgr      *permission.Manager
 	permRef      context.Reference
@@ -79,20 +81,35 @@ type model struct {
 	availModels  []llm.Model
 	cursor       int
 
-	conversation     []llm.Message
-	inFlightMsgIdx   int
-	fixAttempt       int
-	currentCode      string
-	currentLang      string
-	recentContext    []context.Reference
+	conversation   []llm.Message
+	sessionID      string
+	inFlightMsgIdx int
+	fixAttempt     int
+	currentPrompt  string
+	currentCode    string
+	currentLang    string
+	recentContext  []context.Reference
+	refPicker      referencePicker
+	selectedRefs   []string
 }
 
 func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Executor, ws *workspace.Context) model {
-	ti := textinput.New()
+	ti := textarea.New()
 	ti.Placeholder = "Ask Rose anything... (@path for context)"
-	ti.Focus()
+	ti.Prompt = "> "
+	ti.ShowLineNumbers = false
+	ti.EndOfBufferCharacter = ' '
 	ti.CharLimit = 4000
-	ti.Width = 70
+	ti.MaxWidth = 0
+	ti.MaxHeight = 6
+	ti.SetWidth(66)
+	ti.SetHeight(3)
+	ti.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ti.FocusedStyle.CursorLineNumber = lipgloss.NewStyle()
+	ti.BlurredStyle.CursorLine = lipgloss.NewStyle()
+	ti.BlurredStyle.CursorLineNumber = lipgloss.NewStyle()
+	ti.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("ctrl+j"))
+	ti.Focus()
 
 	vp := viewport.New(80, 20)
 	vp.Style = lipgloss.NewStyle().Padding(0, 1)
@@ -109,6 +126,10 @@ func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Exe
 	if ws.RoseRoot != "" && ws.RoseRoot != ws.ProjectRoot {
 		status += " | ✦ self-aware"
 	}
+	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
+	if store != nil {
+		_ = store.SaveMessage(sessionID, ws.ProjectName, "system", "Session started: "+status, "", 0)
+	}
 
 	return model{
 		config:     cfg,
@@ -124,9 +145,11 @@ func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Exe
 		viewport:   vp,
 		input:      ti,
 		spinner:    s,
+		refPicker:  newReferencePicker(ws.ProjectRoot),
 		mode:       modeChat,
 		execPhase:  phaseIdle,
 		status:     status,
+		sessionID:  sessionID,
 		conversation: []llm.Message{
 			{Role: "system", Content: buildSystemPrompt(cfg.ActiveModel, ws, improver)},
 		},
@@ -169,6 +192,12 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 	b.WriteString("3. If execution fails, the error is returned to you\n")
 	b.WriteString("4. Fix the code and the system will re-execute\n")
 	b.WriteString("5. This repeats until success or max attempts reached\n")
+
+	b.WriteString("\n## File Editing Protocol\n")
+	b.WriteString("- When creating or editing project files, emit fenced blocks with paths, for example ```path=sandbox_test/hello_world.cpp\n")
+	b.WriteString("- Use one fenced block per file and include the complete desired file content\n")
+	b.WriteString("- Do not claim files were created unless you emitted file blocks for them\n")
+	b.WriteString("- If you also need to test the files, add a separate ```bash block after the file blocks\n")
 
 	b.WriteString("\n## Learning Strategy\n")
 	b.WriteString("- Abstract patterns: learn language-agnostic solutions\n")
@@ -213,9 +242,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.viewport.Width = msg.Width - 4
-		m.viewport.Height = msg.Height - 10
-		m.input.Width = msg.Width - 10
+		m.resizeComponents()
 
 	case modelsLoadedMsg:
 		if msg.err == nil {
@@ -246,6 +273,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateChat(msg)
 		}
 
+	case tea.MouseMsg:
+		switch m.mode {
+		case modeChat, modeCode:
+			var cmd tea.Cmd
+			m.viewport, cmd = m.viewport.Update(msg)
+			return m, cmd
+		}
+
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -258,21 +293,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(m.renderMessages())
 			m.viewport.GotoBottom()
 
-			code, lang := extractCodeBlock(fullContent)
-			if code != "" {
-				if lang == "" {
-					lang = m.executor.DetectLanguage(code)
-				}
-				if lang != "" {
-					m.currentCode = code
-					m.currentLang = lang
-					m.fixAttempt = 0
-					m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: fullContent})
-					return m, m.executeCurrent()
-				}
+			blocks := extractCodeBlocks(fullContent)
+			edits := inferFileEdits(blocks, m.currentPrompt, fullContent)
+			if len(edits) > 0 {
+				m.currentCode = summarizeFileEdits(edits)
+				m.currentLang = "edits"
+				m.fixAttempt = 0
+				m.execPhase = phaseExecuting
+				m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: fullContent})
+				runCode, runLang := firstRunnableBlock(blocks, editedBlockIndexes(edits), m.executor)
+				return m, m.applyFileEdits(edits, runCode, runLang)
+			}
+
+			code, lang := firstRunnableBlock(blocks, nil, m.executor)
+			if code != "" && lang != "" {
+				m.currentCode = code
+				m.currentLang = lang
+				m.fixAttempt = 0
+				m.execPhase = phaseExecuting
+				m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: fullContent})
+				return m, m.executeCurrent()
 			}
 
 			m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: fullContent})
+			m.saveChat("assistant", fullContent, "", 0)
 			m.execPhase = phaseIdle
 			m.viewport.SetContent(m.renderMessages())
 			m.viewport.GotoBottom()
@@ -286,15 +330,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case execResultMsg:
 		if msg.result.ExitCode == 0 {
 			expResult := fmt.Sprintf("\n\n✓ **Execution succeeded** (%s):\n```\n%s\n```", msg.result.Duration, msg.result.Stdout)
+			if changes := formatChanges(msg.result.Changes); changes != "" {
+				expResult += fmt.Sprintf("\n\nChanged files:\n```\n%s\n```", changes)
+			}
 			m.messages[m.inFlightMsgIdx].content += expResult
-			m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: m.messages[m.inFlightMsgIdx].content})
+			m.setLatestAssistantContent(m.messages[m.inFlightMsgIdx].content)
+			m.saveChat("assistant", m.messages[m.inFlightMsgIdx].content, m.currentLang, 0)
 
 			if m.store != nil {
-				m.store.SaveExperience(
-					m.conversation[len(m.conversation)-2].Content,
+				m.store.SaveExperienceWithChanges(
+					m.currentPrompt,
 					m.messages[m.inFlightMsgIdx].content,
 					m.currentCode, m.currentLang,
 					msg.result.Stdout, msg.result.Stderr,
+					formatChanges(msg.result.Changes),
 					0, m.workspace.ProjectName, int64(m.fixAttempt),
 				)
 			}
@@ -322,8 +371,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.fixAttempt >= 5 {
 				m.messages = append(m.messages, message{role: "system",
 					content: fmt.Sprintf("Gave up after %d fix attempts.", m.fixAttempt)})
-				m.conversation = append(m.conversation,
-					llm.Message{Role: "assistant", Content: m.messages[m.inFlightMsgIdx].content})
+				m.setLatestAssistantContent(m.messages[m.inFlightMsgIdx].content)
+				m.saveChat("assistant", m.messages[m.inFlightMsgIdx].content, m.currentLang, msg.result.ExitCode)
+				m.saveChat("system", fmt.Sprintf("Gave up after %d fix attempts.", m.fixAttempt), "", msg.result.ExitCode)
 				m.execPhase = phaseIdle
 				m.viewport.SetContent(m.renderMessages())
 				m.viewport.GotoBottom()
@@ -332,14 +382,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			m.status = fmt.Sprintf("fixing (attempt %d/5)...", m.fixAttempt)
-			m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: m.messages[m.inFlightMsgIdx].content})
+			m.setLatestAssistantContent(m.messages[m.inFlightMsgIdx].content)
+			m.saveChat("assistant", m.messages[m.inFlightMsgIdx].content, m.currentLang, msg.result.ExitCode)
 
 			if m.store != nil {
-				m.store.SaveExperience(
-					m.conversation[len(m.conversation)-2].Content,
+				m.store.SaveExperienceWithChanges(
+					m.currentPrompt,
 					m.messages[m.inFlightMsgIdx].content,
 					m.currentCode, m.currentLang,
 					msg.result.Stdout, msg.result.Stderr,
+					formatChanges(msg.result.Changes),
 					msg.result.ExitCode, m.workspace.ProjectName, int64(m.fixAttempt-1),
 				)
 			}
@@ -358,10 +410,54 @@ Please fix the code. Output ONLY the corrected code block. Do not explain.
 			return m, m.streamLLM()
 		}
 
+	case editResultMsg:
+		if msg.err != nil {
+			m.execPhase = phaseIdle
+			m.messages[m.inFlightMsgIdx].content += fmt.Sprintf("\n\n✗ **Edit failed**:\n```\n%s\n```", msg.err)
+			m.setLatestAssistantContent(m.messages[m.inFlightMsgIdx].content)
+			m.saveChat("assistant", m.messages[m.inFlightMsgIdx].content, "edits", -1)
+			m.viewport.SetContent(m.renderMessages())
+			m.viewport.GotoBottom()
+			m.status = fmt.Sprintf("model: %s | edit failed", m.config.ActiveModel)
+			return m, nil
+		}
+
+		m.messages[m.inFlightMsgIdx].content = renderEditResponse(m.messages[m.inFlightMsgIdx].content, msg.edits)
+		m.setLatestAssistantContent(m.messages[m.inFlightMsgIdx].content)
+		m.saveChat("assistant", m.messages[m.inFlightMsgIdx].content, "edits", 0)
+
+		if m.store != nil {
+			m.store.SaveExperienceWithChanges(
+				m.currentPrompt,
+				m.messages[m.inFlightMsgIdx].content,
+				m.currentCode, "edits",
+				"", "",
+				formatChanges(msg.changes),
+				0, m.workspace.ProjectName, int64(m.fixAttempt),
+			)
+		}
+
+		m.viewport.SetContent(m.renderMessages())
+		m.viewport.GotoBottom()
+
+		if msg.runCode != "" && msg.runLang != "" {
+			m.currentCode = msg.runCode
+			m.currentLang = msg.runLang
+			m.fixAttempt = 0
+			m.execPhase = phaseExecuting
+			return m, m.executeCurrent()
+		}
+
+		m.execPhase = phaseIdle
+		m.status = fmt.Sprintf("model: %s | ✓ edited %d file(s) | %s",
+			m.config.ActiveModel, len(msg.edits), m.workspace.Summary())
+		return m, nil
+
 	case errorMsg:
 		m.execPhase = phaseIdle
 		m.err = msg.err
 		m.messages = append(m.messages, message{role: "system", content: fmt.Sprintf("Error: %s", msg.err)})
+		m.saveChat("system", fmt.Sprintf("Error: %s", msg.err), "", -1)
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
 		m.status = fmt.Sprintf("model: %s | error", m.config.ActiveModel)
@@ -378,6 +474,9 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("model: %s | interrupted", m.config.ActiveModel)
 			return m, nil
 		}
+		if m.handleViewportKey(msg) {
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		return m, cmd
@@ -388,6 +487,10 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "esc":
+		if m.refPicker.Active {
+			m.refPicker.Close()
+			return m, nil
+		}
 		return m, nil
 
 	case "ctrl+l":
@@ -396,6 +499,7 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			{Role: "system", Content: buildSystemPrompt(m.config.ActiveModel, m.workspace, m.improver)},
 		}
 		m.viewport.SetContent("")
+		m.saveChat("system", "Conversation cleared", "", 0)
 		m.status = fmt.Sprintf("model: %s | cleared | %s", m.config.ActiveModel, m.workspace.Summary())
 		return m, nil
 
@@ -437,11 +541,16 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "enter":
+		if m.refPicker.Active && len(m.refPicker.Items) > 0 {
+			m.acceptReferenceSelection()
+			return m, nil
+		}
 		text := m.input.Value()
 		if text == "" {
 			return m, nil
 		}
 		m.input.SetValue("")
+		m.refPicker.Close()
 
 		resolved, refs, err := m.referencer.ResolveAll(text)
 		if err == nil && len(refs) > 0 {
@@ -469,8 +578,11 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		enhanced := m.learner.BuildPrompt(basePrompt, strings.Join(m.workspace.Languages, ","))
 
 		m.messages = append(m.messages, message{role: "user", content: text})
+		m.saveChat("user", text, "", 0)
+		m.selectedRefs = nil
 		m.messages = append(m.messages, message{role: "assistant", content: ""})
 		m.inFlightMsgIdx = len(m.messages) - 1
+		m.currentPrompt = enhanced
 		m.conversation = append(m.conversation, llm.Message{Role: "user", Content: enhanced})
 
 		m.execPhase = phaseWaitingLLM
@@ -487,12 +599,17 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if lang == "" {
 				lang = m.executor.DetectLanguage(text)
 			}
+			if code == "" && lang != "" {
+				code = text
+			}
 			if lang != "" && code != "" {
 				m.messages = append(m.messages, message{role: "user", content: fmt.Sprintf("Running %s code...", lang)})
+				m.saveChat("user", text, lang, 0)
 				m.messages = append(m.messages, message{role: "assistant", content: ""})
 				m.inFlightMsgIdx = len(m.messages) - 1
 				m.currentCode = code
 				m.currentLang = lang
+				m.currentPrompt = text
 				m.fixAttempt = 0
 				m.execPhase = phaseExecuting
 				m.viewport.SetContent(m.renderMessages())
@@ -502,8 +619,29 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if m.handleViewportKey(msg) {
+		return m, nil
+	}
+
+	if m.refPicker.Active {
+		switch msg.String() {
+		case "up", "ctrl+p":
+			m.refPicker.Move(-1)
+			return m, nil
+		case "down", "ctrl+n":
+			m.refPicker.Move(1)
+			return m, nil
+		case "tab":
+			if len(m.refPicker.Items) > 0 {
+				m.acceptReferenceSelection()
+				return m, nil
+			}
+		}
+	}
+
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	m.updateReferencePicker()
 	return m, cmd
 }
 
@@ -523,6 +661,7 @@ func (m model) updateSelfReflect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.SetValue("")
 		m.input.Placeholder = "Ask Rose anything... (@path for context)"
 		m.messages = append(m.messages, message{role: "user", content: "[self-improve] " + text})
+		m.saveChat("user", "[self-improve] "+text, "", 0)
 		m.messages = append(m.messages, message{role: "assistant", content: ""})
 		m.inFlightMsgIdx = len(m.messages) - 1
 		m.viewport.SetContent(m.renderMessages())
@@ -639,7 +778,12 @@ func (m model) executeCurrent() tea.Cmd {
 		}
 		defer exec.Cleanup()
 
-		result, err := exec.RunShell(m.currentCode, m.currentLang)
+		var result *sandbox.Result
+		if isProjectShell(m.currentLang) {
+			result, err = exec.RunProjectShell(m.currentCode, m.workspace.ProjectRoot)
+		} else {
+			result, err = exec.RunShell(m.currentCode, m.currentLang)
+		}
 		if err != nil {
 			return execResultMsg{
 				result: &sandbox.Result{
@@ -649,6 +793,19 @@ func (m model) executeCurrent() tea.Cmd {
 			}
 		}
 		return execResultMsg{result: result}
+	}
+}
+
+func (m model) applyFileEdits(edits []fileEdit, runCode, runLang string) tea.Cmd {
+	return func() tea.Msg {
+		applied, changes, err := applyProjectFileEdits(m.workspace.ProjectRoot, edits)
+		return editResultMsg{
+			edits:   applied,
+			changes: changes,
+			err:     err,
+			runCode: runCode,
+			runLang: runLang,
+		}
 	}
 }
 
@@ -702,6 +859,7 @@ func (m model) updateRoseRepo() tea.Cmd {
 
 func (m model) addSystemMsg(text string) {
 	m.messages = append(m.messages, message{role: "system", content: text})
+	m.saveChat("system", text, "", 0)
 	m.viewport.SetContent(m.renderMessages())
 	m.viewport.GotoBottom()
 }
@@ -718,6 +876,14 @@ type errorMsg struct {
 
 type execResultMsg struct {
 	result *sandbox.Result
+}
+
+type editResultMsg struct {
+	edits   []appliedEdit
+	changes []sandbox.FileChange
+	err     error
+	runCode string
+	runLang string
 }
 
 type selfApplyMsg struct {
@@ -737,34 +903,19 @@ func (m model) View() string {
 	default:
 		main = m.renderMain()
 	}
-	return AppStyle.Render(main)
+	totalWidth := m.width
+	if totalWidth <= 0 {
+		totalWidth = 86
+	}
+	return styleForTotalWidth(AppStyle, totalWidth).Render(main)
 }
 
 func extractCodeBlock(content string) (code string, language string) {
-	lines := strings.Split(content, "\n")
-	inBlock := false
-	for _, line := range lines {
-		t := strings.TrimSpace(line)
-		if strings.HasPrefix(t, "```") {
-			if !inBlock {
-				inBlock = true
-				lang := strings.TrimPrefix(t, "```")
-				lang = strings.TrimSpace(lang)
-				if lang != "" && !strings.Contains(lang, " ") {
-					language = lang
-				}
-			} else {
-				break
-			}
-		} else if inBlock {
-			if code == "" {
-				code = line
-			} else {
-				code += "\n" + line
-			}
-		}
+	blocks := extractCodeBlocks(content)
+	if len(blocks) == 0 {
+		return "", ""
 	}
-	return
+	return blocks[0].Content, blocks[0].Language
 }
 
 func min(a, b int) int {
@@ -772,6 +923,83 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (m model) saveChat(role, content, language string, exitCode int) {
+	if m.store == nil || m.sessionID == "" {
+		return
+	}
+	_ = m.store.SaveMessage(m.sessionID, m.workspace.ProjectName, role, content, language, exitCode)
+}
+
+func (m *model) setLatestAssistantContent(content string) {
+	for i := len(m.conversation) - 1; i >= 0; i-- {
+		if m.conversation[i].Role == "assistant" {
+			m.conversation[i].Content = content
+			return
+		}
+	}
+	m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: content})
+}
+
+func isProjectShell(lang string) bool {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "bash", "sh", "shell":
+		return true
+	default:
+		return false
+	}
+}
+
+func formatChanges(changes []sandbox.FileChange) string {
+	if len(changes) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, change := range changes {
+		if change.Kind == "deleted" {
+			b.WriteString(fmt.Sprintf("%s %s\n", change.Kind, change.Path))
+			continue
+		}
+		b.WriteString(fmt.Sprintf("%s %s (%d bytes)\n", change.Kind, change.Path, change.Size))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m *model) handleViewportKey(msg tea.KeyMsg) bool {
+	switch msg.String() {
+	case "pgup":
+		m.viewport.PageUp()
+		return true
+	case "pgdown":
+		m.viewport.PageDown()
+		return true
+	case "alt+up", "ctrl+up":
+		m.viewport.ScrollUp(3)
+		return true
+	case "alt+down", "ctrl+down":
+		m.viewport.ScrollDown(3)
+		return true
+	case "ctrl+home":
+		m.viewport.GotoTop()
+		return true
+	case "ctrl+end":
+		m.viewport.GotoBottom()
+		return true
+	}
+
+	if m.input.Value() == "" {
+		switch msg.String() {
+		case "up":
+			m.viewport.ScrollUp(1)
+			return true
+		case "down":
+			m.viewport.ScrollDown(1)
+			return true
+		}
+	}
+
+	return false
 }
 
 func max(a, b int) int {
