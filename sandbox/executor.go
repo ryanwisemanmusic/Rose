@@ -19,9 +19,31 @@ type Result struct {
 }
 
 type Executor struct {
-	WorkDir  string
-	Timeout  time.Duration
-	KeepDir  bool
+	WorkDir          string
+	Timeout          time.Duration
+	KeepDir          bool
+	BlockGitWrite    bool
+	ExperimentalMode bool
+}
+
+var gitWriteCommands = map[string]bool{
+	"commit": true, "push": true, "merge": true, "rebase": true,
+	"cherry-pick": true, "revert": true, "tag": true, "reset": true,
+	"bisect": true, "notes": true, "replace": true, "update-ref": true,
+	"worktree": true, "submodule": true, "gc": true, "prune": true,
+	"clean": true, "rm": true, "mv": true, "checkout-index": true,
+	"commit-tree": true, "write-tree": true, "mktag": true,
+	"filter-branch": true, "am": true, "apply": true,
+}
+
+var gitReadCommands = map[string]bool{
+	"log": true, "diff": true, "status": true, "show": true,
+	"branch": true, "rev-parse": true, "config": true, "describe": true,
+	"blame": true, "grep": true, "ls-files": true, "ls-tree": true,
+	"cat-file": true, "diff-tree": true, "diff-files": true,
+	"diff-index": true, "for-each-ref": true, "shortlog": true,
+	"stash": true, "remote": true, "fetch": true, "pull": true,
+	"checkout": true, "switch": true, "restore": true,
 }
 
 func NewExecutor(timeoutSec int) (*Executor, error) {
@@ -52,6 +74,14 @@ func (e *Executor) ReadFile(name string) (string, error) {
 }
 
 func (e *Executor) Run(command string, args ...string) (*Result, error) {
+	if blocked, reason := e.checkBlocked(command, args); blocked {
+		return &Result{
+			Stderr:   reason,
+			ExitCode: -3,
+			Duration: 0,
+		}, nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), e.Timeout)
 	defer cancel()
 
@@ -83,6 +113,29 @@ func (e *Executor) Run(command string, args ...string) (*Result, error) {
 		ExitCode: exitCode,
 		Duration: duration,
 	}, nil
+}
+
+func (e *Executor) checkBlocked(command string, args []string) (bool, string) {
+	if e.ExperimentalMode {
+		return false, ""
+	}
+	if !e.BlockGitWrite {
+		return false, ""
+	}
+	if command != "git" {
+		return false, ""
+	}
+	if len(args) == 0 {
+		return false, ""
+	}
+	subcmd := args[0]
+	if gitWriteCommands[subcmd] {
+		return true, fmt.Sprintf("BLOCKED: 'git %s' is disabled by default. Use experimental/ directory for write access.", subcmd)
+	}
+	if !gitReadCommands[subcmd] && !gitWriteCommands[subcmd] {
+		return true, fmt.Sprintf("BLOCKED: 'git %s' is not in the allowed command list.", subcmd)
+	}
+	return false, ""
 }
 
 func (e *Executor) RunShell(code string, lang string) (*Result, error) {
