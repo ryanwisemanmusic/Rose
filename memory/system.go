@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,8 +42,16 @@ func SystemMemoryLineFromRequest(request string) (string, bool) {
 		return "", false
 	}
 
+	if strings.Contains(lower, "drive") && (strings.Contains(lower, "directory") || strings.Contains(lower, "folder") || strings.Contains(lower, "path")) {
+		return "- Do not create project-relative directories from fragments of the absolute workspace path; edit paths must stay relative to the current workspace root unless the system explicitly permits an external tool path.", true
+	}
+
+	if strings.Contains(lower, "sandbox_test") || strings.Contains(lower, "sandbox text") || strings.Contains(lower, "sandbox_text") {
+		return "- When the user asks for files in a named workspace subdirectory, write them directly under that project-relative subdirectory and never under copied fragments of the absolute workspace path.", true
+	}
+
 	if strings.Contains(lower, "makefile") || strings.Contains(lower, "make run") {
-		return "- When generating Makefiles, always include a `run` target that executes the compiled program.", true
+		return "- When generating Makefiles, include a default build target for plain `make` and a `run` target that executes the compiled program.", true
 	}
 
 	matches := quotedMemoryPattern.FindAllStringSubmatch(request, -1)
@@ -58,11 +67,17 @@ func SystemMemoryLineFromRequest(request string) (string, bool) {
 	if best == "" {
 		return "", false
 	}
+	if !hasEnoughMemoryMeaning(best) {
+		return "", false
+	}
 	return formatMemoryLine(best), true
 }
 
 func AppendSystemMemory(roseRoot, line string) (string, error) {
 	line = formatMemoryLine(line)
+	if line == "" {
+		return "", errors.New("empty system memory")
+	}
 	path := SystemMemoryPath(roseRoot)
 	if path == "" {
 		return "", os.ErrInvalid
@@ -119,6 +134,14 @@ func formatMemoryLine(line string) string {
 	}
 	line = strings.TrimSuffix(line, ".")
 	return "- " + line + "."
+}
+
+func hasEnoughMemoryMeaning(text string) bool {
+	fields := strings.Fields(text)
+	if len(fields) >= 3 {
+		return true
+	}
+	return strings.Contains(text, "/") || strings.Contains(text, "`")
 }
 
 func defaultSystemMemoryHeader() string {

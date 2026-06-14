@@ -32,7 +32,7 @@ type appliedEdit struct {
 }
 
 var (
-	fileAssignmentPattern = regexp.MustCompile(`(?i)(file|path|filename)\s*[:=]\s*["']?([^"'\s]+)`)
+	fileAssignmentPattern = regexp.MustCompile(`(?i)(file|path|filename)\s*[:=]\s*(?:"([^"]+)"|'([^']+)'|([^"'\s]+))`)
 	filePathPattern       = regexp.MustCompile(`(?i)(^|[\s"'(])((([A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(cpp|cc|cxx|c|hpp|hh|hxx|h|go|py|js|jsx|ts|tsx|rs|zig|java|rb|swift|kt|kts|md|txt|json|yaml|yml|toml|sh|bash|mk))|(([A-Za-z0-9_.-]+/)?Makefile))($|[\s"',).:])`)
 	folderPattern         = regexp.MustCompile(`(?i)(in|inside|under|within|into)?\s*(the\s+)?([A-Za-z0-9_.-]+)\s+(folder|directory|dir)\b`)
 )
@@ -124,8 +124,12 @@ func explicitPathFromInfo(info string) string {
 		return ""
 	}
 
-	if match := fileAssignmentPattern.FindStringSubmatch(info); len(match) >= 3 {
-		return normalizeCandidate(match[2])
+	if match := fileAssignmentPattern.FindStringSubmatch(info); len(match) >= 5 {
+		for _, candidate := range match[2:] {
+			if candidate != "" {
+				return normalizeCandidate(candidate)
+			}
+		}
 	}
 
 	fields := strings.Fields(info)
@@ -249,6 +253,11 @@ func applyProjectFileEdits(projectRoot string, edits []fileEdit) ([]appliedEdit,
 	var changes []sandbox.FileChange
 
 	for _, edit := range edits {
+		edit.Path = repairWorkspacePathFragment(projectRoot, edit.Path)
+		if isSuspiciousWorkspacePathFragment(projectRoot, edit.Path) {
+			return applied, changes, fmt.Errorf("refusing suspicious workspace path fragment: %s", edit.Path)
+		}
+
 		fullPath, relPath, err := resolveProjectPath(projectRoot, edit.Path)
 		if err != nil {
 			return applied, changes, err
@@ -289,6 +298,63 @@ func applyProjectFileEdits(projectRoot string, edits []fileEdit) ([]appliedEdit,
 	return applied, changes, nil
 }
 
+func repairWorkspacePathFragment(projectRoot, path string) string {
+	clean := normalizeCandidate(path)
+	if clean == "" || filepath.IsAbs(clean) {
+		return clean
+	}
+
+	root := filepath.ToSlash(filepath.Clean(projectRoot))
+	rootBase := filepath.Base(root)
+	if rootBase == "" || rootBase == "." {
+		return clean
+	}
+
+	segments := strings.Split(clean, "/")
+	if len(segments) > 1 && strings.EqualFold(segments[0], rootBase) {
+		return strings.Join(segments[1:], "/")
+	}
+
+	for i := 1; i < len(segments)-1; i++ {
+		if strings.EqualFold(segments[i], rootBase) && looksLikeWorkspacePrefix(projectRoot, segments[:i]) {
+			return strings.Join(segments[i+1:], "/")
+		}
+	}
+
+	return clean
+}
+
+func isSuspiciousWorkspacePathFragment(projectRoot, path string) bool {
+	clean := normalizeCandidate(path)
+	if clean == "" || filepath.IsAbs(clean) {
+		return false
+	}
+	segments := strings.Split(clean, "/")
+	if len(segments) == 0 {
+		return false
+	}
+	return looksLikeWorkspacePrefix(projectRoot, segments[:1])
+}
+
+func looksLikeWorkspacePrefix(projectRoot string, prefix []string) bool {
+	if len(prefix) == 0 {
+		return false
+	}
+	first := prefix[0]
+	root := filepath.ToSlash(filepath.Clean(projectRoot))
+	for _, component := range strings.Split(root, "/") {
+		if component != "" && strings.EqualFold(first, component) {
+			return true
+		}
+		for _, token := range strings.Fields(component) {
+			if token != "" && strings.EqualFold(first, token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func inferPostEditRun(prompt string, edits []fileEdit) (string, string) {
 	if !promptRequestsRun(prompt) {
 		return "", ""
@@ -306,6 +372,69 @@ func inferPostEditRun(prompt string, edits []fileEdit) (string, string) {
 	}
 
 	return "", ""
+}
+
+func promptRequiresFileEdits(prompt string) bool {
+	lower := strings.ToLower(prompt)
+	if strings.Contains(lower, "system memory") || strings.Contains(lower, "system.txt") || strings.Contains(lower, "memory/system.txt") {
+		return false
+	}
+	if strings.Contains(lower, "how do i") || strings.Contains(lower, "how to") {
+		return false
+	}
+
+	hasAction := false
+	for _, phrase := range []string{
+		"create",
+		"make me",
+		"make a",
+		"generate",
+		"write",
+		"edit",
+		"update",
+		"modify",
+	} {
+		if strings.Contains(lower, phrase) {
+			hasAction = true
+			break
+		}
+	}
+	if !hasAction {
+		return false
+	}
+
+	for _, target := range []string{
+		" file",
+		" files",
+		" app",
+		" application",
+		" project",
+		"sandbox_test",
+		"makefile",
+		".cpp",
+		".go",
+		".py",
+		".js",
+		".ts",
+		".rs",
+		".zig",
+		".md",
+		".txt",
+	} {
+		if strings.Contains(lower, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func missingFileBlocksRetryPrompt() string {
+	return `Your previous answer did not create files because it did not include applicable fenced file blocks.
+
+Re-answer with complete file contents using one fenced block per file, for example:
+` + "```path=sandbox_test/hello_world.cpp\n<complete file content>\n```" + `
+
+	Use project-relative paths only. Do not include absolute workspace paths or copied workspace-path fragments. If the user asked to run or verify the result, add a final bash block.`
 }
 
 func promptRequestsRun(prompt string) bool {

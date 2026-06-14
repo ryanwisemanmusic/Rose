@@ -3,11 +3,13 @@ package llm
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type Client struct {
@@ -88,7 +90,14 @@ func (c *Client) Chat(model string, messages []Message, opts Options, cb StreamC
 }
 
 func (c *Client) ListModels() ([]Model, error) {
-	resp, err := http.Get(c.host + "/api/tags")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", c.host+"/api/tags", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create list models request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("list models: %w", err)
 	}

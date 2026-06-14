@@ -12,4 +12,7 @@ Durable memories:
 - When asked to update Rose's memories, prefer a small edit to memory/system.txt unless the request requires code behavior changes.
 - Before proposing or applying code edits, read the relevant files and preserve the existing project style.
 - For local Ollama models, avoid keeping very large models resident indefinitely after prompts; use an explicit keep_alive policy.
-- Drive.
+- When generating Makefiles, include a default build target for plain `make` and a `run` target that executes the compiled program.
+- Do not create project-relative directories from fragments of the absolute workspace path; edit paths must stay relative to the current workspace root unless the system explicitly permits an external tool path.
+- When the user asks for files in a named workspace subdirectory, write them directly under that project-relative subdirectory and never under copied fragments of the absolute workspace path.
+- For C++ hello-world examples, write valid C++ source with `#include <iostream>`, `int main()`, and a greeting printed to standard output.

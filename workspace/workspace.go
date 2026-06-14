@@ -1,10 +1,12 @@
 package workspace
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 var BuildRoseRoot string
@@ -26,7 +28,9 @@ func Detect() *Context {
 	c.ProjectName = filepath.Base(c.CurrentDir)
 	c.ProjectRoot = c.CurrentDir
 
-	if gitRoot, err := exec.Command("git", "rev-parse", "--show-toplevel").Output(); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if gitRoot, err := exec.CommandContext(ctx, "git", "rev-parse", "--show-toplevel").Output(); err == nil {
 		c.IsGitRepo = true
 		c.GitRoot = strings.TrimSpace(string(gitRoot))
 		c.ProjectName = filepath.Base(c.GitRoot)
@@ -61,6 +65,8 @@ func detectLanguages(root string) []string {
 	var langs []string
 	seen := make(map[string]bool)
 	maxDepth := 4
+	visited := 0
+	deadline := time.Now().Add(750 * time.Millisecond)
 	skipped := map[string]bool{
 		"node_modules": true, "vendor": true, "target": true,
 		".git": true, ".svn": true, "dist": true, "build": true,
@@ -70,6 +76,10 @@ func detectLanguages(root string) []string {
 	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
+		}
+		visited++
+		if visited > 5000 || time.Now().After(deadline) {
+			return filepath.SkipAll
 		}
 		if info.IsDir() {
 			if skipped[info.Name()] {

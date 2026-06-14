@@ -41,9 +41,14 @@ func main() {
 	}
 	defer executor.Cleanup()
 
+	options := []tea.ProgramOption{}
+	if os.Getenv("ROSE_NO_ALT_SCREEN") != "1" {
+		options = append(options, tea.WithAltScreen())
+	}
+
 	p := tea.NewProgram(
 		tui.InitialModel(cfg, store, executor, ws),
-		tea.WithAltScreen(),
+		options...,
 	)
 
 	if _, err := p.Run(); err != nil {

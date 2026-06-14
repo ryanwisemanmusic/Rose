@@ -41,9 +41,35 @@ func TestSystemMemoryLineFromMakeRunRequest(t *testing.T) {
 	if !ok {
 		t.Fatal("expected request to be recognized")
 	}
-	want := "- When generating Makefiles, always include a `run` target that executes the compiled program."
+	want := "- When generating Makefiles, include a default build target for plain `make` and a `run` target that executes the compiled program."
 	if line != want {
 		t.Fatalf("line = %q, want %q", line, want)
+	}
+}
+
+func TestSystemMemoryLineFromDriveDirectoryRequest(t *testing.T) {
+	line, ok := SystemMemoryLineFromRequest("update system.txt: don't create a new directory called Drive")
+	if !ok {
+		t.Fatal("expected request to be recognized")
+	}
+	if !strings.Contains(line, "absolute workspace path") || !strings.Contains(line, "current workspace root") {
+		t.Fatalf("line is not meaningful enough: %q", line)
+	}
+}
+
+func TestSystemMemoryRejectsOneWordQuotedMemory(t *testing.T) {
+	if line, ok := SystemMemoryLineFromRequest("update system.txt with 'Drive'"); ok {
+		t.Fatalf("expected one-word memory to be rejected, got %q", line)
+	}
+}
+
+func TestSystemMemoryLineFromSandboxTestRequest(t *testing.T) {
+	line, ok := SystemMemoryLineFromRequest("update memory so sandbox_test files are created in the right place")
+	if !ok {
+		t.Fatal("expected request to be recognized")
+	}
+	if !strings.Contains(line, "named workspace subdirectory") || !strings.Contains(line, "project-relative subdirectory") {
+		t.Fatalf("line is not specific enough: %q", line)
 	}
 }
 

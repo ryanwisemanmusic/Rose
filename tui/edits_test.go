@@ -32,6 +32,53 @@ func TestInferFileEditsFromFencePath(t *testing.T) {
 	}
 }
 
+func TestInferFileEditsFromQuotedAbsoluteFencePathWithSpaces(t *testing.T) {
+	response := "```path=\"/workspace/Project Root/App/sandbox_test/hello_world.cpp\"\nint main() { return 0; }\n```"
+
+	edits := inferFileEdits(extractCodeBlocks(response), "", response)
+
+	if len(edits) != 1 {
+		t.Fatalf("expected 1 edit, got %d", len(edits))
+	}
+	if edits[0].Path != "/workspace/Project Root/App/sandbox_test/hello_world.cpp" {
+		t.Fatalf("edit path = %q", edits[0].Path)
+	}
+}
+
+func TestRepairWorkspacePathFragment(t *testing.T) {
+	root := "/workspace/Project Root/App"
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"Root/App/sandbox_test/hello_world.cpp", "sandbox_test/hello_world.cpp"},
+		{"App/sandbox_test/hello_world.cpp", "sandbox_test/hello_world.cpp"},
+	} {
+		if got := repairWorkspacePathFragment(root, tc.in); got != tc.want {
+			t.Fatalf("repairWorkspacePathFragment(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestSuspiciousWorkspacePathFragment(t *testing.T) {
+	root := "/workspace/Project Root/App"
+	if !isSuspiciousWorkspacePathFragment(root, "Root/sandbox_test/hello_world.cpp") {
+		t.Fatal("expected copied workspace fragment to be suspicious")
+	}
+	if isSuspiciousWorkspacePathFragment(root, "sandbox_test/hello_world.cpp") {
+		t.Fatal("sandbox_test should be allowed")
+	}
+}
+
+func TestPromptRequiresFileEdits(t *testing.T) {
+	if !promptRequiresFileEdits("make me a hello_world application in sandbox_test") {
+		t.Fatal("expected prompt to require file edits")
+	}
+	if promptRequiresFileEdits("how do I create a hello world app?") {
+		t.Fatal("how-to prompt should not require file edits")
+	}
+}
+
 func TestInferPostEditRunForMakefileInFolder(t *testing.T) {
 	code, lang := inferPostEditRun(
 		"make me a hello_world application and then run the application after",

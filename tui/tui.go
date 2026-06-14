@@ -81,16 +81,17 @@ type model struct {
 	availModels  []llm.Model
 	cursor       int
 
-	conversation   []llm.Message
-	sessionID      string
-	inFlightMsgIdx int
-	fixAttempt     int
-	currentPrompt  string
-	currentCode    string
-	currentLang    string
-	recentContext  []context.Reference
-	refPicker      referencePicker
-	selectedRefs   []string
+	conversation       []llm.Message
+	sessionID          string
+	inFlightMsgIdx     int
+	fixAttempt         int
+	currentPrompt      string
+	currentCode        string
+	currentLang        string
+	formatRetryAttempt int
+	recentContext      []context.Reference
+	refPicker          referencePicker
+	selectedRefs       []string
 }
 
 func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Executor, ws *workspace.Context) model {
@@ -127,9 +128,6 @@ func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Exe
 		status += " | ✦ self-aware"
 	}
 	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
-	if store != nil {
-		_ = store.SaveMessage(sessionID, ws.ProjectName, "system", "Session started: "+status, "", 0)
-	}
 
 	return model{
 		config:     cfg,
@@ -206,9 +204,10 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 	b.WriteString("\n## File Editing Protocol\n")
 	b.WriteString("- When creating or editing project files, emit fenced blocks with paths, for example ```path=sandbox_test/hello_world.cpp\n")
 	b.WriteString("- Use one fenced block per file and include the complete desired file content\n")
-	b.WriteString("- Do not claim files were created unless you emitted file blocks for them\n")
+	b.WriteString("- Plain prose does not create files. Do not claim files were created unless you emitted file blocks and the system reports created/modified files\n")
+	b.WriteString("- Use project-relative paths only. Never include the absolute workspace path or copied fragments of it in edit paths\n")
 	b.WriteString("- If you also need to test the files, add a separate ```bash block after the file blocks\n")
-	b.WriteString("- When generating Makefiles, include a `run` target; verify Makefile projects with `make run` or `cd subdir && make run`\n")
+	b.WriteString("- When generating Makefiles, include a default build target for plain `make` and a `run` target; verify with `make run` or `cd subdir && make run`\n")
 
 	b.WriteString("\n## Learning Strategy\n")
 	b.WriteString("- Abstract patterns: learn language-agnostic solutions\n")
@@ -228,7 +227,16 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, m.loadModels())
+	return tea.Batch(m.spinner.Tick, m.loadModels(), m.logSessionStart())
+}
+
+func (m model) logSessionStart() tea.Cmd {
+	return func() tea.Msg {
+		if m.store != nil && m.sessionID != "" {
+			_ = m.store.SaveMessage(m.sessionID, m.workspace.ProjectName, "system", "Session started: "+m.status, "", 0)
+		}
+		return sessionStartedMsg{}
+	}
 }
 
 func (m model) loadModels() tea.Cmd {
@@ -245,6 +253,8 @@ type modelsLoadedMsg struct {
 	models []llm.Model
 	err    error
 }
+
+type sessionStartedMsg struct{}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -310,6 +320,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentCode = summarizeFileEdits(edits)
 				m.currentLang = "edits"
 				m.fixAttempt = 0
+				m.formatRetryAttempt = 0
 				m.execPhase = phaseExecuting
 				m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: fullContent})
 				runCode, runLang := firstRunnableBlock(blocks, editedBlockIndexes(edits), m.executor)
@@ -321,14 +332,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentCode = code
 				m.currentLang = lang
 				m.fixAttempt = 0
+				m.formatRetryAttempt = 0
 				m.execPhase = phaseExecuting
 				m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: fullContent})
 				return m, m.executeCurrent()
 			}
 
+			if promptRequiresFileEdits(m.currentPrompt) {
+				if m.formatRetryAttempt < 1 {
+					m.formatRetryAttempt++
+					m.conversation = append(m.conversation,
+						llm.Message{Role: "assistant", Content: fullContent},
+						llm.Message{Role: "user", Content: missingFileBlocksRetryPrompt()},
+					)
+					m.messages = append(m.messages, message{
+						role:    "system",
+						content: "No file blocks were emitted, so no files were created. Retrying with explicit project-relative file blocks.",
+					})
+					m.messages = append(m.messages, message{role: "assistant", content: ""})
+					m.inFlightMsgIdx = len(m.messages) - 1
+					m.execPhase = phaseWaitingLLM
+					m.viewport.SetContent(m.renderMessages())
+					m.viewport.GotoBottom()
+					m.status = fmt.Sprintf("model: %s | retrying file output...", m.config.ActiveModel)
+					return m, m.streamLLM()
+				}
+				fullContent += "\n\n✗ No file blocks were emitted, so Rose did not create or modify files. Use fenced blocks like ```path=sandbox_test/file.ext to apply file changes."
+				m.messages[m.inFlightMsgIdx].content = fullContent
+			}
+
 			m.conversation = append(m.conversation, llm.Message{Role: "assistant", Content: fullContent})
 			m.saveChat("assistant", fullContent, "", 0)
 			m.execPhase = phaseIdle
+			m.formatRetryAttempt = 0
 			m.viewport.SetContent(m.renderMessages())
 			m.viewport.GotoBottom()
 			m.status = fmt.Sprintf("model: %s | ready | %s", m.config.ActiveModel, m.workspace.Summary())
@@ -631,6 +667,7 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.messages = append(m.messages, message{role: "assistant", content: ""})
 		m.inFlightMsgIdx = len(m.messages) - 1
 		m.currentPrompt = enhanced
+		m.formatRetryAttempt = 0
 		m.conversation = append(m.conversation, llm.Message{Role: "user", Content: enhanced})
 
 		m.execPhase = phaseWaitingLLM
