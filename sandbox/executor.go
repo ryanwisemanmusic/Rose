@@ -55,6 +55,41 @@ var gitReadCommands = map[string]bool{
 	"checkout": true, "switch": true, "restore": true,
 }
 
+type blockedCommand struct {
+	Pattern string
+	Reason  string
+}
+
+var blockedPatterns = []blockedCommand{
+	{Pattern: "rm -rf /", Reason: "catastrophic root deletion"},
+	{Pattern: "rm -rf ~", Reason: "home directory deletion"},
+	{Pattern: "rm -rf $HOME", Reason: "home directory deletion"},
+	{Pattern: "rm -rf /*", Reason: "catastrophic root deletion"},
+	{Pattern: "> /dev/sd", Reason: "raw disk write"},
+	{Pattern: "> /dev/disk", Reason: "raw disk write"},
+	{Pattern: "mkfs.", Reason: "filesystem format"},
+	{Pattern: "dd if=", Reason: "raw disk operation"},
+	{Pattern: ":(){ :|:& };:", Reason: "fork bomb"},
+	{Pattern: "DROP TABLE", Reason: "database table destruction"},
+	{Pattern: "DROP DATABASE", Reason: "database destruction"},
+	{Pattern: "TRUNCATE TABLE", Reason: "database table truncation"},
+	{Pattern: "chmod -R 777 /", Reason: "insecure root permissions"},
+	{Pattern: "curl | sh", Reason: "piped remote execution"},
+	{Pattern: "curl | bash", Reason: "piped remote execution"},
+	{Pattern: "wget | sh", Reason: "piped remote execution"},
+	{Pattern: "wget | bash", Reason: "piped remote execution"},
+}
+
+func checkDangerousCommand(command string) (blocked bool, reason string) {
+	lower := strings.ToLower(command)
+	for _, bc := range blockedPatterns {
+		if strings.Contains(lower, strings.ToLower(bc.Pattern)) {
+			return true, fmt.Sprintf("BLOCKED: command contains '%s' — %s", bc.Pattern, bc.Reason)
+		}
+	}
+	return false, ""
+}
+
 func NewExecutor(timeoutSec int) (*Executor, error) {
 	workDir, err := os.MkdirTemp("", "rose-sandbox-*")
 	if err != nil {
@@ -135,6 +170,16 @@ func (e *Executor) checkBlocked(command string, args []string) (bool, string) {
 	if e.ExperimentalMode {
 		return false, ""
 	}
+
+	// Check for dangerous commands regardless of git-write settings.
+	fullCmd := command
+	if len(args) > 0 {
+		fullCmd = command + " " + strings.Join(args, " ")
+	}
+	if blocked, reason := checkDangerousCommand(fullCmd); blocked {
+		return true, reason
+	}
+
 	if !e.BlockGitWrite {
 		return false, ""
 	}
@@ -179,6 +224,18 @@ func (e *Executor) RunProjectShell(code string, projectRoot string) (*Result, er
 	root, err := filepath.Abs(projectRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolve project root: %w", err)
+	}
+
+	// Check shell script content for dangerous commands before executing.
+	if !e.ExperimentalMode {
+		if blocked, reason := checkDangerousCommand(code); blocked {
+			return &Result{
+				Stderr:   reason,
+				ExitCode: -3,
+				Duration: 0,
+				WorkDir:  root,
+			}, nil
+		}
 	}
 
 	before, err := snapshotFiles(root)

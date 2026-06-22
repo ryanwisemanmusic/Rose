@@ -20,7 +20,7 @@ func TestChatSendsKeepAlive(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL)
+	client := NewOllamaProvider(server.URL)
 	_, err := client.Chat("test-model", []Message{{Role: "user", Content: "hello"}}, Options{
 		Temperature: 0.2,
 		MaxTokens:   128,

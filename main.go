@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/ryanwi/rose/config"
+	"github.com/ryanwi/rose/llm"
 	"github.com/ryanwi/rose/memory"
 	"github.com/ryanwi/rose/sandbox"
 	"github.com/ryanwi/rose/tui"
@@ -46,8 +48,16 @@ func main() {
 		options = append(options, tea.WithAltScreen())
 	}
 
+	var provider llm.Provider
+	if cfg.Provider == "mlx" {
+		args := strings.Fields(cfg.MLXArgs)
+		provider = llm.NewMLXProvider(cfg.MLXBaseURL, cfg.MLXModel, cfg.MLXCommand, args, cfg.MLXAutoStart)
+	} else {
+		provider = llm.NewOllamaProvider(cfg.OllamaHost)
+	}
+
 	p := tea.NewProgram(
-		tui.InitialModel(cfg, store, executor, ws),
+		tui.InitialModel(cfg, store, executor, ws, provider),
 		options...,
 	)
 
@@ -55,4 +65,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+
+	provider.Stop()
 }

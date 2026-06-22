@@ -1,5 +1,16 @@
 package llm
 
+import "context"
+
+type Provider interface {
+	Chat(model string, messages []Message, opts Options, cb StreamCallback) (string, error)
+	ListModels() ([]Model, error)
+	Start(ctx context.Context) error
+	Stop() error
+}
+
+type StreamCallback func(chunk string) error
+
 type Model struct {
 	Name        string `json:"name"`
 	Size        string `json:"size"`
@@ -13,6 +24,7 @@ var KnownModels = []Model{
 	{Name: "gemma3:4b", Size: "3.3 GB", Description: "Lightweight, good for simple tasks", Capability: "limited"},
 	{Name: "gemma3:1b", Size: "815 MB", Description: "Ultra-lightweight, fast responses", Capability: "minimal"},
 	{Name: "llama2-uncensored:latest", Size: "3.8 GB", Description: "Uncensored general model", Capability: "full"},
+	{Name: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit", Size: "4 GB", Description: "MLX-optimized 7B coding model", Capability: "full"},
 }
 
 type Message struct {

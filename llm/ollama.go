@@ -12,17 +12,23 @@ import (
 	"time"
 )
 
-type Client struct {
+type OllamaProvider struct {
 	host string
 }
 
-type StreamCallback func(chunk string) error
-
-func NewClient(host string) *Client {
-	return &Client{host: strings.TrimRight(host, "/")}
+func NewOllamaProvider(host string) *OllamaProvider {
+	return &OllamaProvider{host: strings.TrimRight(host, "/")}
 }
 
-func (c *Client) Chat(model string, messages []Message, opts Options, cb StreamCallback) (string, error) {
+func (p *OllamaProvider) Start(ctx context.Context) error {
+	return nil
+}
+
+func (p *OllamaProvider) Stop() error {
+	return nil
+}
+
+func (p *OllamaProvider) Chat(model string, messages []Message, opts Options, cb StreamCallback) (string, error) {
 	req := ChatRequest{
 		Model:     model,
 		Messages:  messages,
@@ -36,7 +42,7 @@ func (c *Client) Chat(model string, messages []Message, opts Options, cb StreamC
 		return "", fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequest("POST", c.host+"/api/chat", bytes.NewReader(body))
+	httpReq, err := http.NewRequest("POST", p.host+"/api/chat", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("create request: %w", err)
 	}
@@ -89,11 +95,11 @@ func (c *Client) Chat(model string, messages []Message, opts Options, cb StreamC
 	return full.String(), scanner.Err()
 }
 
-func (c *Client) ListModels() ([]Model, error) {
+func (p *OllamaProvider) ListModels() ([]Model, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", c.host+"/api/tags", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", p.host+"/api/tags", nil)
 	if err != nil {
 		return nil, fmt.Errorf("create list models request: %w", err)
 	}

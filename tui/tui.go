@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -14,7 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ryanwi/rose/config"
-	"github.com/ryanwi/rose/context"
+	rosecontext "github.com/ryanwi/rose/context"
 	"github.com/ryanwi/rose/core"
 	"github.com/ryanwi/rose/llm"
 	"github.com/ryanwi/rose/memory"
@@ -50,14 +51,14 @@ const (
 
 type model struct {
 	config     *config.Config
-	llmClient  *llm.Client
+	provider   llm.Provider
 	store      *memory.Store
 	executor   *sandbox.Executor
 	learner    *memory.Learner
 	improver   *core.SelfImprover
 	workspace  *workspace.Context
-	referencer *context.Referencer
-	docReader  *context.DocReader
+	referencer *rosecontext.Referencer
+	docReader  *rosecontext.DocReader
 
 	width     int
 	height    int
@@ -73,13 +74,12 @@ type model struct {
 	err    error
 
 	permMgr      *permission.Manager
-	permRef      context.Reference
-	permRefs     []context.Reference
+	permRef      rosecontext.Reference
+	permRefs     []rosecontext.Reference
 	permResolved string
 
-	ollamaModels []llm.Model
-	availModels  []llm.Model
-	cursor       int
+	availModels []llm.Model
+	cursor      int
 
 	conversation       []llm.Message
 	sessionID          string
@@ -89,12 +89,12 @@ type model struct {
 	currentCode        string
 	currentLang        string
 	formatRetryAttempt int
-	recentContext      []context.Reference
+	recentContext      []rosecontext.Reference
 	refPicker          referencePicker
 	selectedRefs       []string
 }
 
-func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Executor, ws *workspace.Context) model {
+func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Executor, ws *workspace.Context, provider llm.Provider) model {
 	ti := textarea.New()
 	ti.Placeholder = "Ask Rose anything... (@path for context)"
 	ti.Prompt = "> "
@@ -123,23 +123,26 @@ func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Exe
 	improver := core.NewSelfImprover(cfg.RoseRoot)
 	permMgr := permission.NewManager(ws.ProjectRoot)
 
+	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
+
 	status := fmt.Sprintf("model: %s | %s", cfg.ActiveModel, ws.Summary())
-	if ws.RoseRoot != "" && ws.RoseRoot != ws.ProjectRoot {
+	if cfg.Provider == "mlx" {
+		status = fmt.Sprintf("MLX: starting %s...", cfg.MLXModel)
+	} else if ws.RoseRoot != "" && ws.RoseRoot != ws.ProjectRoot {
 		status += " | ✦ self-aware"
 	}
-	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
 
 	return model{
 		config:     cfg,
-		llmClient:  llm.NewClient(cfg.OllamaHost),
+		provider:   provider,
 		store:      store,
 		executor:   executor,
 		learner:    memory.NewLearner(store),
 		improver:   improver,
 		workspace:  ws,
 		permMgr:    permMgr,
-		referencer: context.NewReferencer(ws.ProjectRoot, permMgr),
-		docReader:  context.NewDocReader(),
+		referencer: rosecontext.NewReferencer(ws.ProjectRoot, permMgr),
+		docReader:  rosecontext.NewDocReader(),
 		viewport:   vp,
 		input:      ti,
 		spinner:    s,
@@ -227,7 +230,7 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, m.loadModels(), m.logSessionStart())
+	return tea.Batch(m.spinner.Tick, m.startProvider(), m.logSessionStart())
 }
 
 func (m model) logSessionStart() tea.Cmd {
@@ -239,17 +242,20 @@ func (m model) logSessionStart() tea.Cmd {
 	}
 }
 
-func (m model) loadModels() tea.Cmd {
+func (m model) startProvider() tea.Cmd {
 	return func() tea.Msg {
-		models, err := m.llmClient.ListModels()
-		if err != nil {
-			return modelsLoadedMsg{models: nil, err: err}
+		if err := m.provider.Start(context.Background()); err != nil {
+			return providerReadyMsg{err: err}
 		}
-		return modelsLoadedMsg{models: models}
+		models, err := m.provider.ListModels()
+		if err != nil {
+			return providerReadyMsg{err: err}
+		}
+		return providerReadyMsg{models: models}
 	}
 }
 
-type modelsLoadedMsg struct {
+type providerReadyMsg struct {
 	models []llm.Model
 	err    error
 }
@@ -265,18 +271,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.resizeComponents()
 
-	case modelsLoadedMsg:
-		if msg.err == nil {
-			m.ollamaModels = msg.models
-			m.availModels = msg.models
+	case providerReadyMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			m.availModels = llm.KnownModels
+			m.status = fmt.Sprintf("model: %s | provider error", m.config.ActiveModel)
 		} else {
-			m.availModels = llm.KnownModels
+			modelName := m.config.ActiveModel
+			if m.config.Provider == "mlx" {
+				modelName = m.config.MLXModel
+			}
+			m.availModels = msg.models
+			if len(m.availModels) == 0 {
+				m.availModels = llm.KnownModels
+			}
+			m.status = fmt.Sprintf("model: %s | %d models | %s",
+				modelName, len(m.availModels), m.workspace.Summary())
 		}
-		if len(m.availModels) == 0 {
-			m.availModels = llm.KnownModels
-		}
-		m.status = fmt.Sprintf("model: %s | %d models | %s",
-			m.config.ActiveModel, len(m.availModels), m.workspace.Summary())
 
 	case tea.KeyMsg:
 		switch m.mode {
@@ -845,7 +856,7 @@ func (m model) updateModelSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) streamLLM() tea.Cmd {
 	return func() tea.Msg {
-		full, err := m.llmClient.Chat(
+		full, err := m.provider.Chat(
 			m.config.ActiveModel,
 			m.conversation,
 			llm.Options{
@@ -937,7 +948,7 @@ func (m model) selfReflect(query string) tea.Cmd {
 			{Role: "user", Content: ctx.String()},
 		}
 
-		result, err := m.llmClient.Chat(
+		result, err := m.provider.Chat(
 			m.config.ActiveModel, prompt,
 			llm.Options{Temperature: 0.4, MaxTokens: 4096, KeepAlive: m.config.OllamaKeepAlive}, nil,
 		)
