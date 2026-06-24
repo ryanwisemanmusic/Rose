@@ -51,7 +51,8 @@ func main() {
 	var provider llm.Provider
 	if cfg.Provider == "mlx" {
 		args := strings.Fields(cfg.MLXArgs)
-		provider = llm.NewMLXProvider(cfg.MLXBaseURL, cfg.MLXModel, cfg.MLXCommand, args, cfg.MLXAutoStart)
+		autoStart := cfg.MLXAutoStart != nil && *cfg.MLXAutoStart
+		provider = llm.NewMLXProvider(cfg.MLXBaseURL, cfg.MLXModel, cfg.MLXCommand, args, autoStart)
 	} else {
 		provider = llm.NewOllamaProvider(cfg.OllamaHost)
 	}

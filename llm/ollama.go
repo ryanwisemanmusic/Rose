@@ -67,7 +67,7 @@ func (p *OllamaProvider) Chat(model string, messages []Message, opts Options, cb
 		if chatResp.Error != "" {
 			return "", fmt.Errorf("ollama error: %s", chatResp.Error)
 		}
-		return chatResp.Message.Content, nil
+		return CleanResponse(chatResp.Message.Content), nil
 	}
 
 	var full strings.Builder
@@ -86,13 +86,17 @@ func (p *OllamaProvider) Chat(model string, messages []Message, opts Options, cb
 			return "", fmt.Errorf("ollama error: %s", chatResp.Error)
 		}
 		if chatResp.Message.Content != "" {
-			if err := cb(chatResp.Message.Content); err != nil {
+			cleaned := CleanResponse(chatResp.Message.Content)
+			if cleaned == "" {
+				continue
+			}
+			if err := cb(cleaned); err != nil {
 				return "", err
 			}
-			full.WriteString(chatResp.Message.Content)
+			full.WriteString(cleaned)
 		}
 	}
-	return full.String(), scanner.Err()
+	return CleanResponse(full.String()), scanner.Err()
 }
 
 func (p *OllamaProvider) ListModels() ([]Model, error) {

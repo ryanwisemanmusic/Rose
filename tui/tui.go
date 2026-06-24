@@ -92,6 +92,8 @@ type model struct {
 	recentContext      []rosecontext.Reference
 	refPicker          referencePicker
 	selectedRefs       []string
+
+	streamCh chan llmStreamMsg
 }
 
 func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Executor, ws *workspace.Context, provider llm.Provider) model {
@@ -125,7 +127,11 @@ func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Exe
 
 	sessionID := fmt.Sprintf("%d", time.Now().UnixNano())
 
-	status := fmt.Sprintf("model: %s | %s", cfg.ActiveModel, ws.Summary())
+	initialModel := cfg.ActiveModel
+	if cfg.Provider == "mlx" {
+		initialModel = cfg.MLXModel
+	}
+	status := fmt.Sprintf("model: %s | %s", initialModel, ws.Summary())
 	if cfg.Provider == "mlx" {
 		status = fmt.Sprintf("MLX: starting %s...", cfg.MLXModel)
 	} else if ws.RoseRoot != "" && ws.RoseRoot != ws.ProjectRoot {
@@ -151,8 +157,9 @@ func InitialModel(cfg *config.Config, store *memory.Store, executor *sandbox.Exe
 		execPhase:  phaseIdle,
 		status:     status,
 		sessionID:  sessionID,
+		streamCh:   make(chan llmStreamMsg, 256),
 		conversation: []llm.Message{
-			{Role: "system", Content: buildSystemPrompt(cfg.ActiveModel, ws, improver)},
+			{Role: "system", Content: buildSystemPrompt(initialModel, ws, improver)},
 		},
 	}
 }
@@ -179,14 +186,30 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 	b.WriteString("- Do not edit memory/store.go just to add a memory; only edit it for storage behavior or schema changes\n")
 	b.WriteString("- Past successes AND failures are retrieved to inform future responses\n")
 	b.WriteString("- When code fails, read the error and fix it automatically\n")
+	b.WriteString("- To save what you learn, use memory markers in your response:\n")
+	b.WriteString("  • `[memory: ...]` for general lessons (saved to memory/system.txt)\n")
+	b.WriteString("  • `[pattern: ...]` for reusable code patterns (saved to memory/patterns/)\n")
+	b.WriteString("  • `[fix: ...]` for common fixes (saved to memory/fixes/)\n")
+	b.WriteString("  • `[workflow: ...]` for development workflows (saved to memory/workflows/)\n")
+	b.WriteString("- These memories persist across all projects and guide you in future sessions\n")
+	b.WriteString("- Memory files are under the `memory/` directory in the Rose repo\n")
+
+	b.WriteString("\n## Codebase Exploration Tools\n")
+	b.WriteString("You can explore the project before making changes:\n")
+	b.WriteString("- `[read: path]` - read a file (project-relative or absolute); also lists directories\n")
+	b.WriteString("- `[grep: pattern]` - search codebase for a pattern (supports regex)\n")
+	b.WriteString("- `[glob: pattern]` - find files matching a glob (e.g. **/*.go)\n")
+	b.WriteString("- Use these to understand existing code before writing or editing files\n")
+	b.WriteString("- Tools are only executed once per request; multiple tools can be listed\n")
+	b.WriteString("- After tool results are returned, continue with the task\n")
 	if ws.RoseRoot != "" {
 		b.WriteString(fmt.Sprintf("- Your source code is at: %s\n", ws.RoseRoot))
 		b.WriteString("- You can propose improvements to your own code\n")
 	}
 
-	if systemMemory, err := memory.LoadSystemMemory(ws.RoseRoot); err == nil && systemMemory != "" {
-		b.WriteString("\n## Durable System Memory\n")
-		b.WriteString(systemMemory)
+	if allMem := memory.LoadAllMemory(ws.RoseRoot); allMem != "" {
+		b.WriteString("\n## Durable Memories\n")
+		b.WriteString(allMem)
 		b.WriteString("\n")
 	}
 
@@ -196,6 +219,12 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 	b.WriteString("- @/absolute/path resolves absolute paths for docs\n")
 	b.WriteString("- Use these to read documentation, existing code, etc.\n")
 
+	b.WriteString("\n## Question vs Request\n")
+	b.WriteString("- If the user asks an informational question (about your capabilities, how something works, etc.), answer with text only\n")
+	b.WriteString("- Do NOT create files, write code, or execute commands unless the user explicitly asks you to create, write, generate, or modify something\n")
+	b.WriteString("- If the user says \"how do I...\" or \"explain...\", explain the steps but do NOT create files or run code\n")
+	b.WriteString("- Only emit ```path=... or ```language blocks when the user uses action words like \"create\", \"write\", \"make\", \"generate\", \"edit\", \"build\"\n")
+
 	b.WriteString("\n## Code Execution Protocol\n")
 	b.WriteString("1. Write code with ```language blocks\n")
 	b.WriteString("2. The system will automatically execute your code\n")
@@ -203,8 +232,10 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 	b.WriteString("4. Fix the code and the system will re-execute\n")
 	b.WriteString("5. This repeats until success or max attempts reached\n")
 	b.WriteString("6. When the user explicitly asks you to run, test, verify, or execute something, emit a ```bash block with the terminal command to run\n")
+	b.WriteString("7. If you explain how to run code in prose rather than a ```bash block, the system will NOT execute it\n")
 
 	b.WriteString("\n## File Editing Protocol\n")
+	b.WriteString("- Only emit file blocks when the user explicitly asks to create, write, edit, modify, generate, or update files\n")
 	b.WriteString("- When creating or editing project files, emit fenced blocks with paths, for example ```path=sandbox_test/hello_world.cpp\n")
 	b.WriteString("- Use one fenced block per file and include the complete desired file content\n")
 	b.WriteString("- Plain prose does not create files. Do not claim files were created unless you emitted file blocks and the system reports created/modified files\n")
@@ -230,7 +261,14 @@ func buildSystemPrompt(modelName string, ws *workspace.Context, improver *core.S
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, m.startProvider(), m.logSessionStart())
+	return tea.Batch(m.spinner.Tick, m.startProvider(), m.logSessionStart(), m.listenStream())
+}
+
+// listenStream waits for streaming chunks from the LLM provider.
+func (m model) listenStream() tea.Cmd {
+	return func() tea.Msg {
+		return <-m.streamCh
+	}
 }
 
 func (m model) logSessionStart() tea.Cmd {
@@ -274,13 +312,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case providerReadyMsg:
 		if msg.err != nil {
 			m.err = msg.err
-			m.availModels = llm.KnownModels
-			m.status = fmt.Sprintf("model: %s | provider error", m.config.ActiveModel)
-		} else {
-			modelName := m.config.ActiveModel
 			if m.config.Provider == "mlx" {
-				modelName = m.config.MLXModel
+				m.availModels = []llm.Model{{Name: m.config.MLXModel, Size: "MLX", Description: "MLX model", Capability: "full"}}
+			} else {
+				m.availModels = llm.KnownModels
 			}
+			m.status = fmt.Sprintf("model: %s | provider error", m.modelLabel())
+		} else {
+			modelName := m.modelLabel()
 			m.availModels = msg.models
 			if len(m.availModels) == 0 {
 				m.availModels = llm.KnownModels
@@ -319,9 +358,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case llmStreamMsg:
+		if msg.err != nil {
+			m.execPhase = phaseIdle
+			m.err = msg.err
+			m.messages = append(m.messages, message{role: "system", content: fmt.Sprintf("Error: %s", msg.err)})
+			m.saveChat("system", fmt.Sprintf("Error: %s", msg.err), "", -1)
+			m.viewport.SetContent(m.renderMessages())
+			m.viewport.GotoBottom()
+			m.status = fmt.Sprintf("model: %s | error", m.modelLabel())
+			return m, nil
+		}
 		if msg.done {
 			fullContent := msg.full
 			m.messages[m.inFlightMsgIdx].content = fullContent
+
+			roseRoot := m.config.RoseRoot
+			if roseRoot == "" {
+				roseRoot = m.workspace.RoseRoot
+			}
+			if markers := memory.ExtractMemoryMarkers(fullContent); len(markers) > 0 && roseRoot != "" {
+				n := memory.SaveMemoryMarkers(markers, roseRoot)
+				if n > 0 {
+					m.conversation[0] = llm.Message{Role: "system", Content: buildSystemPrompt(m.modelLabel(), m.workspace, m.improver)}
+				}
+			}
+
+			if toolReqs := extractToolMarkers(fullContent); len(toolReqs) > 0 {
+				var results []toolResult
+				for _, req := range toolReqs {
+					results = append(results, executeTool(req, m.workspace.ProjectRoot))
+				}
+				toolOutput := formatToolResults(results)
+				m.conversation = append(m.conversation,
+					llm.Message{Role: "assistant", Content: fullContent},
+					llm.Message{Role: "system", Content: "Tool results:\n" + toolOutput + "\n\nContinue with the task using the information above. Do not repeat tool requests that were already fulfilled."},
+				)
+				m.messages = append(m.messages, message{role: "system", content: "Read files and searched code as requested. Continuing..."})
+				m.messages = append(m.messages, message{role: "assistant", content: ""})
+				m.inFlightMsgIdx = len(m.messages) - 1
+				m.execPhase = phaseWaitingLLM
+				m.viewport.SetContent(m.renderMessages())
+				m.viewport.GotoBottom()
+				m.status = fmt.Sprintf("model: %s | tools executing...", m.modelLabel())
+				return m, m.streamLLM()
+			}
+
 			m.viewport.SetContent(m.renderMessages())
 			m.viewport.GotoBottom()
 
@@ -365,7 +446,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.execPhase = phaseWaitingLLM
 					m.viewport.SetContent(m.renderMessages())
 					m.viewport.GotoBottom()
-					m.status = fmt.Sprintf("model: %s | retrying file output...", m.config.ActiveModel)
+					m.status = fmt.Sprintf("model: %s | retrying file output...", m.modelLabel())
 					return m, m.streamLLM()
 				}
 				fullContent += "\n\n✗ No file blocks were emitted, so Rose did not create or modify files. Use fenced blocks like ```path=sandbox_test/file.ext to apply file changes."
@@ -378,11 +459,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.formatRetryAttempt = 0
 			m.viewport.SetContent(m.renderMessages())
 			m.viewport.GotoBottom()
-			m.status = fmt.Sprintf("model: %s | ready | %s", m.config.ActiveModel, m.workspace.Summary())
+			m.status = fmt.Sprintf("model: %s | ready | %s", m.modelLabel(), m.workspace.Summary())
 		} else {
 			m.messages[m.inFlightMsgIdx].content += msg.chunk
 			m.viewport.SetContent(m.renderMessages())
 			m.viewport.GotoBottom()
+			return m, m.listenStream()
 		}
 
 	case execResultMsg:
@@ -410,7 +492,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(m.renderMessages())
 			m.viewport.GotoBottom()
 			m.status = fmt.Sprintf("model: %s | ✓ exec %s | %s",
-				m.config.ActiveModel, msg.result.Duration, m.workspace.Summary())
+				m.modelLabel(), msg.result.Duration, m.workspace.Summary())
 		} else {
 			m.execPhase = phaseFixing
 			m.fixAttempt++
@@ -435,7 +517,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.execPhase = phaseIdle
 				m.viewport.SetContent(m.renderMessages())
 				m.viewport.GotoBottom()
-				m.status = fmt.Sprintf("model: %s | ✗ failed after %d attempts", m.config.ActiveModel, m.fixAttempt)
+				m.status = fmt.Sprintf("model: %s | ✗ failed after %d attempts", m.modelLabel(), m.fixAttempt)
 				return m, nil
 			}
 
@@ -459,7 +541,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 Error output:
 %s
 
-Please fix the code. Output ONLY the corrected code block. Do not explain.
+Please fix the code. Output ONLY the corrected code block. Do not explain. Optionally include [memory: ...] if a reusable pattern emerged.
 `, msg.result.ExitCode, errorOutput)
 
 			m.messages = append(m.messages, message{role: "assistant", content: ""})
@@ -476,7 +558,7 @@ Please fix the code. Output ONLY the corrected code block. Do not explain.
 			m.saveChat("assistant", m.messages[m.inFlightMsgIdx].content, "edits", -1)
 			m.viewport.SetContent(m.renderMessages())
 			m.viewport.GotoBottom()
-			m.status = fmt.Sprintf("model: %s | edit failed", m.config.ActiveModel)
+			m.status = fmt.Sprintf("model: %s | edit failed", m.modelLabel())
 			return m, nil
 		}
 
@@ -508,7 +590,7 @@ Please fix the code. Output ONLY the corrected code block. Do not explain.
 
 		m.execPhase = phaseIdle
 		m.status = fmt.Sprintf("model: %s | ✓ edited %d file(s) | %s",
-			m.config.ActiveModel, len(msg.edits), m.workspace.Summary())
+			m.modelLabel(), len(msg.edits), m.workspace.Summary())
 		return m, nil
 
 	case systemMemoryUpdateMsg:
@@ -519,17 +601,17 @@ Please fix the code. Output ONLY the corrected code block. Do not explain.
 			m.err = msg.err
 			m.messages[m.inFlightMsgIdx].content = fmt.Sprintf("Error updating %s: %s", memory.SystemMemoryRelPath, msg.err)
 			m.saveChat("assistant", m.messages[m.inFlightMsgIdx].content, "", -1)
-			m.status = fmt.Sprintf("model: %s | memory update failed", m.config.ActiveModel)
+			m.status = fmt.Sprintf("model: %s | memory update failed", m.modelLabel())
 		} else {
 			content := fmt.Sprintf("Updated `%s`:\n%s", memory.SystemMemoryRelPath, msg.line)
 			m.messages[m.inFlightMsgIdx].content = content
 			m.saveChat("assistant", content, "", 0)
-			m.conversation[0] = llm.Message{Role: "system", Content: buildSystemPrompt(m.config.ActiveModel, m.workspace, m.improver)}
+			m.conversation[0] = llm.Message{Role: "system", Content: buildSystemPrompt(m.modelLabel(), m.workspace, m.improver)}
 			m.conversation = append(m.conversation,
 				llm.Message{Role: "user", Content: m.currentPrompt},
 				llm.Message{Role: "assistant", Content: content},
 			)
-			m.status = fmt.Sprintf("model: %s | updated system memory | %s", m.config.ActiveModel, m.workspace.Summary())
+			m.status = fmt.Sprintf("model: %s | updated system memory | %s", m.modelLabel(), m.workspace.Summary())
 		}
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
@@ -542,7 +624,7 @@ Please fix the code. Output ONLY the corrected code block. Do not explain.
 		m.saveChat("system", fmt.Sprintf("Error: %s", msg.err), "", -1)
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
-		m.status = fmt.Sprintf("model: %s | error", m.config.ActiveModel)
+		m.status = fmt.Sprintf("model: %s | error", m.modelLabel())
 	}
 
 	return m, tea.Batch(cmds...)
@@ -553,7 +635,7 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			m.execPhase = phaseIdle
-			m.status = fmt.Sprintf("model: %s | interrupted", m.config.ActiveModel)
+			m.status = fmt.Sprintf("model: %s | interrupted", m.modelLabel())
 			return m, nil
 		}
 		if m.handleViewportKey(msg) {
@@ -578,11 +660,11 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+l":
 		m.messages = nil
 		m.conversation = []llm.Message{
-			{Role: "system", Content: buildSystemPrompt(m.config.ActiveModel, m.workspace, m.improver)},
+			{Role: "system", Content: buildSystemPrompt(m.modelLabel(), m.workspace, m.improver)},
 		}
 		m.viewport.SetContent("")
 		m.saveChat("system", "Conversation cleared", "", 0)
-		m.status = fmt.Sprintf("model: %s | cleared | %s", m.config.ActiveModel, m.workspace.Summary())
+		m.status = fmt.Sprintf("model: %s | cleared | %s", m.modelLabel(), m.workspace.Summary())
 		return m, nil
 
 	case "ctrl+t":
@@ -599,7 +681,7 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.mode = modeChat
 			m.input.Placeholder = "Ask Rose anything... (@path for context)"
-			m.status = fmt.Sprintf("model: %s | chat | %s", m.config.ActiveModel, m.workspace.Summary())
+			m.status = fmt.Sprintf("model: %s | chat | %s", m.modelLabel(), m.workspace.Summary())
 		}
 		return m, nil
 
@@ -684,7 +766,7 @@ func (m model) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.execPhase = phaseWaitingLLM
 		m.viewport.SetContent(m.renderMessages())
 		m.viewport.GotoBottom()
-		m.status = fmt.Sprintf("model: %s | thinking...", m.config.ActiveModel)
+		m.status = fmt.Sprintf("model: %s | thinking...", m.modelLabel())
 
 		return m, m.streamLLM()
 
@@ -746,7 +828,7 @@ func (m model) updateSelfReflect(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.mode = modeChat
 		m.input.Placeholder = "Ask Rose anything... (@path for context)"
-		m.status = fmt.Sprintf("model: %s | ready | %s", m.config.ActiveModel, m.workspace.Summary())
+		m.status = fmt.Sprintf("model: %s | ready | %s", m.modelLabel(), m.workspace.Summary())
 		return m, nil
 
 	case "enter":
@@ -787,7 +869,7 @@ func (m model) updatePermission(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		for _, r := range refs {
 			if r.Blocked {
 				m.mode = modeChat
-				m.status = fmt.Sprintf("model: %s | blocked", m.config.ActiveModel)
+				m.status = fmt.Sprintf("model: %s | blocked", m.modelLabel())
 				return m, nil
 			}
 		}
@@ -796,7 +878,7 @@ func (m model) updatePermission(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(refs) > 0 {
 			m.addSystemMsg(fmt.Sprintf("Loaded %s", m.referencer.SummarizeRefs(refs)))
 		}
-		m.status = fmt.Sprintf("model: %s | ready", m.config.ActiveModel)
+		m.status = fmt.Sprintf("model: %s | ready", m.modelLabel())
 		return m, nil
 
 	case "a", "A":
@@ -807,7 +889,7 @@ func (m model) updatePermission(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		for _, r := range refs {
 			if r.Blocked {
 				m.mode = modeChat
-				m.status = fmt.Sprintf("model: %s | blocked", m.config.ActiveModel)
+				m.status = fmt.Sprintf("model: %s | blocked", m.modelLabel())
 				return m, nil
 			}
 		}
@@ -816,14 +898,14 @@ func (m model) updatePermission(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(refs) > 0 {
 			m.addSystemMsg(fmt.Sprintf("Loaded %s", m.referencer.SummarizeRefs(refs)))
 		}
-		m.status = fmt.Sprintf("model: %s | ready", m.config.ActiveModel)
+		m.status = fmt.Sprintf("model: %s | ready", m.modelLabel())
 		return m, nil
 
 	case "n", "N", "esc":
 		m.permMgr.Deny(m.permRef.BlockPath)
 		m.addSystemMsg(fmt.Sprintf("Denied access to %s", m.permRef.Resolved))
 		m.mode = modeChat
-		m.status = fmt.Sprintf("model: %s | ready", m.config.ActiveModel)
+		m.status = fmt.Sprintf("model: %s | ready", m.modelLabel())
 		return m, nil
 	}
 	return m, nil
@@ -833,7 +915,7 @@ func (m model) updateModelSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeChat
-		m.status = fmt.Sprintf("model: %s | %s", m.config.ActiveModel, m.workspace.Summary())
+		m.status = fmt.Sprintf("model: %s | %s", m.modelLabel(), m.workspace.Summary())
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
@@ -844,33 +926,54 @@ func (m model) updateModelSelection(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		selected := m.availModels[m.cursor].Name
-		m.config.ActiveModel = selected
+		if m.config.Provider == "mlx" {
+			m.config.ActiveModel = selected
+			m.config.MLXModel = selected
+			m.config.MLXArgs = "--model " + selected + " --port 8080"
+		} else {
+			m.config.ActiveModel = selected
+		}
 		m.config.DefaultModelMigrated = true
 		m.config.Save()
 		m.conversation[0] = llm.Message{Role: "system", Content: buildSystemPrompt(selected, m.workspace, m.improver)}
 		m.mode = modeChat
-		m.status = fmt.Sprintf("model: %s | ready | %s", selected, m.workspace.Summary())
+		m.status = fmt.Sprintf("model: %s | ready | %s", m.modelLabel(), m.workspace.Summary())
 	}
 	return m, nil
 }
 
+// modelLabel returns the display name of the active model.
+// For MLX provider, this is always the MLX model to avoid showing
+// stale ActiveModel values from accidental model list selections.
+func (m model) modelLabel() string {
+	if m.config.Provider == "mlx" {
+		return m.config.MLXModel
+	}
+	return m.config.ActiveModel
+}
+
 func (m model) streamLLM() tea.Cmd {
-	return func() tea.Msg {
+	go func() {
 		full, err := m.provider.Chat(
-			m.config.ActiveModel,
+			m.modelLabel(),
 			m.conversation,
 			llm.Options{
 				Temperature: m.config.Temperature,
 				MaxTokens:   m.config.MaxTokens,
 				KeepAlive:   m.config.OllamaKeepAlive,
 			},
-			func(chunk string) error { return nil },
+			func(chunk string) error {
+				m.streamCh <- llmStreamMsg{chunk: chunk}
+				return nil
+			},
 		)
 		if err != nil {
-			return errorMsg{err: err}
+			m.streamCh <- llmStreamMsg{err: err}
+			return
 		}
-		return llmStreamMsg{done: true, full: full}
-	}
+		m.streamCh <- llmStreamMsg{done: true, full: full}
+	}()
+	return m.listenStream()
 }
 
 func (m model) executeCurrent() tea.Cmd {
@@ -949,7 +1052,7 @@ func (m model) selfReflect(query string) tea.Cmd {
 		}
 
 		result, err := m.provider.Chat(
-			m.config.ActiveModel, prompt,
+			m.modelLabel(), prompt,
 			llm.Options{Temperature: 0.4, MaxTokens: 4096, KeepAlive: m.config.OllamaKeepAlive}, nil,
 		)
 		if err != nil {
@@ -990,6 +1093,7 @@ type llmStreamMsg struct {
 	chunk string
 	done  bool
 	full  string
+	err   error
 }
 
 type errorMsg struct {

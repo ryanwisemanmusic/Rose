@@ -103,6 +103,27 @@ func (p *MLXProvider) Start(ctx context.Context) error {
 		return fmt.Errorf("MLX server not running at %s and auto_start is disabled", p.baseURL)
 	}
 
+	return p.startServer(ctx)
+}
+
+// ensureRunning checks if the server is healthy and starts it if not.
+// Unlike Start, this bypasses the autoStart flag so it can recover
+// from crashes even when auto-start was initially disabled.
+func (p *MLXProvider) ensureRunning(ctx context.Context) error {
+	if p.healthCheck() {
+		return nil
+	}
+
+	p.mu.Lock()
+	if p.spawned {
+		p.cleanup()
+	}
+	p.mu.Unlock()
+
+	return p.startServer(ctx)
+}
+
+func (p *MLXProvider) startServer(ctx context.Context) error {
 	cmd := exec.CommandContext(ctx, p.command, p.args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -197,6 +218,10 @@ func (p *MLXProvider) Ready() bool {
 }
 
 func (p *MLXProvider) Chat(model string, messages []Message, opts Options, cb StreamCallback) (string, error) {
+	if err := p.ensureRunning(context.Background()); err != nil {
+		return "", fmt.Errorf("server not available: %w", err)
+	}
+
 	if cb != nil {
 		return p.chatStream(model, messages, opts, cb)
 	}
@@ -247,7 +272,7 @@ func (p *MLXProvider) chat(model string, messages []Message, opts Options) (stri
 		return "", fmt.Errorf("MLX returned no choices")
 	}
 
-	return chatResp.Choices[0].Message.Content, nil
+	return CleanResponse(chatResp.Choices[0].Message.Content), nil
 }
 
 func (p *MLXProvider) chatStream(model string, messages []Message, opts Options, cb StreamCallback) (string, error) {
@@ -309,15 +334,19 @@ func (p *MLXProvider) chatStream(model string, messages []Message, opts Options,
 
 		for _, choice := range chunk.Choices {
 			if choice.Delta != nil && choice.Delta.Content != "" {
-				if err := cb(choice.Delta.Content); err != nil {
+				cleaned := CleanResponse(choice.Delta.Content)
+				if cleaned == "" {
+					continue
+				}
+				if err := cb(cleaned); err != nil {
 					return "", err
 				}
-				full.WriteString(choice.Delta.Content)
+				full.WriteString(cleaned)
 			}
 		}
 	}
 
-	return full.String(), scanner.Err()
+	return CleanResponse(full.String()), scanner.Err()
 }
 
 func (p *MLXProvider) ListModels() ([]Model, error) {

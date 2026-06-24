@@ -25,7 +25,7 @@ type Config struct {
 	DefaultModelMigrated bool    `json:"default_model_migrated"`
 	MLXBaseURL           string  `json:"mlx_base_url"`
 	MLXModel             string  `json:"mlx_model"`
-	MLXAutoStart         bool    `json:"mlx_auto_start"`
+	MLXAutoStart         *bool   `json:"mlx_auto_start"`
 	MLXCommand           string  `json:"mlx_command"`
 	MLXArgs              string  `json:"mlx_args"`
 	MaxTokens            int     `json:"max_tokens"`
@@ -33,6 +33,10 @@ type Config struct {
 	SandboxTimeout       int     `json:"sandbox_timeout"`
 	DataDir              string  `json:"data_dir"`
 	RoseRoot             string  `json:"rose_root"`
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }
 
 func Default() *Config {
@@ -45,7 +49,7 @@ func Default() *Config {
 		DefaultModelMigrated: true,
 		MLXBaseURL:           DefaultMLXBaseURL,
 		MLXModel:             DefaultMLXModel,
-		MLXAutoStart:         true,
+		MLXAutoStart:         boolPtr(true),
 		MLXCommand:           DefaultMLXCommand,
 		MLXArgs:              "--model " + DefaultMLXModel + " --port 8080",
 		MaxTokens:            4096,
@@ -135,6 +139,10 @@ func (c *Config) applyLoadedDefaults(hadDefaultModelMigration bool) bool {
 	}
 	if c.MLXCommand == "" {
 		c.MLXCommand = DefaultMLXCommand
+		changed = true
+	}
+	if c.MLXAutoStart == nil {
+		c.MLXAutoStart = boolPtr(true)
 		changed = true
 	}
 	if c.MLXArgs == "" {

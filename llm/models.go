@@ -1,6 +1,31 @@
 package llm
 
-import "context"
+import (
+	"context"
+	"strings"
+)
+
+// Common tokenizer artifacts to strip from model responses.
+var responseCleaners = []struct {
+	old string
+	new string
+}{
+	{"<|im_end|>", ""},
+	{"<|im_start|>", ""},
+	{"<|endoftext|>", ""},
+	{"</s>", ""},
+	{"<s>", ""},
+}
+
+// CleanResponse strips tokenizer artifacts from a model response.
+func CleanResponse(s string) string {
+	result := s
+	for _, c := range responseCleaners {
+		result = strings.ReplaceAll(result, c.old, c.new)
+	}
+	result = strings.TrimSpace(result)
+	return result
+}
 
 type Provider interface {
 	Chat(model string, messages []Message, opts Options, cb StreamCallback) (string, error)

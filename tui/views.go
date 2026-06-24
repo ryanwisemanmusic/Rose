@@ -226,7 +226,7 @@ func (m model) renderMain() string {
 
 	displayStatus := m.status
 	if phase := m.phaseStatus(); phase != "" {
-		displayStatus = fmt.Sprintf("model: %s | %s | %s", m.config.ActiveModel, phase, m.workspace.Summary())
+		displayStatus = fmt.Sprintf("model: %s | %s | %s", m.modelLabel(), phase, m.workspace.Summary())
 	}
 
 	statusLine := fmt.Sprintf(" %s%s | %s",
